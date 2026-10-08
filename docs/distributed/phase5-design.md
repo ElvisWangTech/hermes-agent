@@ -1,157 +1,157 @@
 # Hermes 分布式改造 · Phase 5 详细设计
 
-> 版本：v1.0（评审稿） ｜ 状态：待确认 ｜ 前置：Phase 1/2/4 已验收（Phase 3 可选）
+> 版本：v1.1（修正稿） ｜ 状态：待确认 ｜ 前置：[Phase 1](phase1-design.md) drain + 快照 replace；[Phase 4](phase4-design.md) S0（若该集群跑 cron）。[Phase 3](phase3-design.md) 默认跳过。
 >
-> 目标一句话：**完整云原生高可用集群**——K8s 部署、Redis 高可用、基于指标的自动扩缩容、优雅退出与灰度发布，并解决长轮询适配器的多副本问题。
+> 目标一句话：用 K8s 跑多副本 api_server；配置与密钥可挂载；托管 Redis + 对象存储；长轮询按 **平台** 拆 leader；HPA 只对增量会话有意义。
+>
+> 相对 v1.0 的撤回：emptyDir 即可冷启动全部状态；Phase 1 协议「已保证」空目录；自建 Redis Sentinel 当默认 HA；一个 `leader_polling.py` 覆盖所有平台；canary 5% 能验证已亲和的老会话；滚动升级「1000 请求零 5xx」建立在 90s 猝死窗口上；sandbox 默认进拓扑。
 
 ---
 
 ## 1. 目标与非目标
 
 ### 目标
-1. 全组件容器化并落地 K8s：gateway（多副本）、Redis（Sentinel 高可用）、sandbox（若启用 Phase 3）。
-2. HPA 自动扩缩容：CPU + 自定义指标（队列堆积）双维度。
-3. 发布能力：就绪/存活探针、优雅退出（改造现有 drain 机制）、滚动升级与灰度。
-4. Telegram 等长轮询适配器多副本化：单 leader 轮询 + 队列分发。
-5. 有状态面收敛：节点本地 state.db 仅作热缓存，空目录可冷启动——这是 HPA 自由伸缩的前提。
+
+1. Gateway Deployment 多副本；**配置 / skills 用 ConfigMap 或镜像，密钥用 Secret**，不是靠 Pod 磁盘当源。
+2. Redis：**托管实例**（与 Kodo 同级「别自建数据面」）。清单里可附 Redis 样例仅供 kind 开发，生产默认不写自建 Sentinel。
+3. 就绪/存活探针、drain（Phase 1 已有 `/admin/drain`）、滚动升级、**仅针对新会话** 的 canary。
+4. 长轮询：独立 poller Deployment，**每个平台一种接入**（getUpdates / 长连接 / 改 webhook），不是单一抽象打天下。
+5. HPA：CPU + 队列深度；文档化与亲和的张力。
 
 ### 非目标
-- 不做多地域多活（单地域多可用区足够；对象存储已跨区域可恢复，DR 走预案）。
-- 不自建 K8s _operator_：用原生 Deployment/StatefulSet/HPA/PDB 即可。
-- 对象存储用七牛 Kodo 云服务，不在集群内部署 MinIO。
+
+- 不多地域多活。
+- 不自建 Operator。
+- 不在集群内默认部署 MinIO（生产用 Kodo 等）；kind 测试可用 MinIO。
+- 不把 Phase 3 sandbox 画成必选。
+- 不声称工作区、本地 memory、未外置的 cron 能随 emptyDir 恢复。
+
+---
 
 ## 2. 集群拓扑
 
 ```
-                 ┌──────── Ingress（无状态转发） ────────┐
-                 │                                       │
-        ┌────────▼─────────┐                    ┌────────▼────────┐
-        │ gateway Deploy    │  HPA 2–10 副本     │ adapter-pollers │
-        │ （api_server+worker）│                  │ Deploy 1 副本     │
-        └────────┬─────────┘                    │ （长轮询→入队）    │
-                 │                              └────────┬────────┘
-        ┌────────▼─────────┐                    ┌────────▼────────┐
-        │ Redis Sentinel    │  1 主 2 从 + 3 哨兵 │ tasks:webhook   │
-        │ StatefulSet       │ ◄──────────────────┘                 │
-        └──────────────────┘
-        对象存储：七牛 Kodo（云服务）   观测：Prometheus + OTLP 后端
+                    Ingress（无状态）
+                         │
+          ┌──────────────┼──────────────┐
+          ▼                             ▼
+   gateway Deploy (HPA)          adapter pollers
+   api_server + （可选）worker     每平台独立：副本 1 + 选主
+          │                             │
+          └──────────┬──────────────────┘
+                     ▼
+              托管 Redis
+              对象存储（Kodo）
+              配置：ConfigMap / 镜像
+              密钥：Secret → 文件或 env（走现有 secret scope，禁止写进 config.yaml）
 ```
 
-## 3. 组件设计
+`state.db` 可用 emptyDir：**仅** Phase 1 已快照的 transcript 能按需拉取。冷启动第一请求延迟含下载+replace+**prompt cache 变冷**，不要写死 < 2s 为验收线；以实测 P95 建基线。
+
+---
+
+## 3. 组件
 
 ### 3.1 gateway Deployment
 
 | 项 | 设计 |
 |---|---|
-| 副本 | 初始 2，HPA 控制 2–10 |
-| 镜像 | 单镜像含 api_server + task_worker（Phase 4）；`cluster.enabled=true` |
-| 探针 | readiness：`/healthz` 检查 Redis 连通 + 自身 claim 能力；liveness：进程存活即可（避免误杀导致会话迁移） |
-| 资源 | request 500m/1Gi，limit 2/4Gi（按压测调整） |
-| 存储 | **emptyDir**——state.db 仅是热缓存；冷启动从 Kodo 按需拉取（Phase 1 协议已保证） |
-| node_id | `POD_NAME`（Downward API 注入），Pod 重建自动生成新身份，旧租约 90s 过期被接管 |
+| 副本 | 初始 2，HPA 2–10 |
+| 镜像 | 与今日 gateway 同一入口；`cluster.enabled=true` |
+| 探针 | readiness：进程 + Redis + 对象存储头探 + 本节点能续自己的 node:addr；liveness：进程存活（避免误杀触发迁移风暴） |
+| `node_id` | `POD_NAME`（Downward API） |
+| 存储 | emptyDir 仅 `state.db` 热缓存；**HERMES_HOME 的 config/skills 只读挂载**；`.env` 来自 Secret |
+| Profile | 多 profile = 多套 home 挂载或多个 Deployment；禁止一个空目录冒充 multiplex 的全部 home |
 
-### 3.2 优雅退出（改造现有 drain 机制）
+### 3.2 Drain 与发布
 
-现状 drain 是写本地 `.drain_request.json` 文件。集群化后：
+Phase 1 已规定 drain。K8s：
 
-1. K8s 删除 Pod → `preStop` 钩子调用本节点 `/admin/drain`；
-2. 节点停止接受**新会话** claim（claim 返回 `is_mine=False` 并主动从路由表摘牌），进行中的 turn 等待完成（上限 120s）；
-3. 全部缓存会话执行快照回写（fencing 条件写）；
-4. 退出。`terminationGracePeriodSeconds: 150` 兜底；超时强杀也无妨——租约过期 + fencing 协议兜底，最坏丢失未回写窗口。
+1. `preStop` 调 `/admin/drain`（内部 token）。
+2. `terminationGracePeriodSeconds` > `drain_timeout_sec`。
+3. 滚动：`maxUnavailable: 0`、`maxSurge: 1`；PDB 至少保证 1 个就绪副本（生产建议更高）。
 
-**会话迁移成本实测目标**：滚动升级期间单次请求额外延迟 < 2s（新节点 claim + 拉快照 + 导入）。
+**Canary：** Ingress 权重/header 只影响 **尚未 claim 的新 session_key**。已绑定的会话仍由 SessionRouter 送到 owner（可能是稳定版 Pod）。文档与发布检查单必须写清：灰度指标看新会话错误率，不要用「总流量 5%」解释亲和流量。混跑期间靠 fencing，不靠版本协商。
 
-### 3.3 Redis Sentinel（StatefulSet）
+**「零 5xx」**：只对 drain 成功的滚动承诺；猝死/Redis 抖动走 Phase 1/4 降级，不得写进同一验收句。
 
-- 1 主 + 2 从 + 3 sentinel；客户端（`redis_backend.py`）改 Sentinel 感知连接（redis-py 原生支持）。
-- 故障切换 RTO ≈ 10–30s；期间按 Phase 4 降级策略运行（队列生产者退回同步、限流 fail_closed）。
-- 数据面风险重估：Redis 丢失未持久化的路由/锁信息**不丢会话数据**（快照在 Kodo），AOF everysec 足够。
+### 3.3 Redis
 
-### 3.4 长轮询适配器多副本化
+生产：云厂商托管 Redis，应用侧 `REDIS_URL`（sentinel/cluster 以厂商 SDK 为准，需要时再扩展 `redis_backend.py`）。
 
-问题：Telegram getUpdates 是单消费者语义，多副本会互相抢 offset。
+kind：可用单容器 Redis。不要把「1 主 2 从 3 哨兵 StatefulSet」当默认交付物。
 
-方案（二选一，默认 A）：
+### 3.4 长轮询 / 网关型平台（按平台，不要一个文件包打）
 
-| 方案 | 做法 | 取舍 |
-|---|---|---|
-| **A. 单 leader 轮询 + 队列分发（默认）** | adapter-pollers 独立 Deployment（1 副本 + leader election 经 LockBackend），拿到消息 `XADD tasks:webhook`，由任意 gateway 消费 | 改动小、复用 Phase 4 队列；副本固定为 1+热备 |
-| B. 改 webhook 接入 | Telegram 改为 setWebhook → Ingress → 任意 gateway | 最云原生，但依赖公网回调域名/证书，且部分平台（微信）不支持；逐平台迁移 |
+问题仍成立：Telegram `getUpdates` 单消费者。
 
-Discord/Slack 等 WebSocket 网关型适配器同理走方案 A（单连接 + 分发）。
+| 平台类型 | Phase 5 做法 |
+|---|---|
+| Telegram 长轮询 | 独立 Deployment 副本=1，LockBackend **按平台+token** 选主；消息 `XADD` 入 Phase 4 队列（须 queue.enabled） |
+| 已支持 HTTP webhook 的平台 | 优先 Ingress → 任意 gateway（比 poller 更贴云原生） |
+| Discord/Slack 长连接 | 各自独立选主连接；不要假设与 Telegram 同一循环 |
+
+热备：选主租约过期后另一 Pod 接。平台侧重投/offset 行为要在该平台 adapter 文档写清，90s 空窗可能丢或重复，靠 Phase 4 幂等。
+
+未启用 Phase 4 队列时：poller **不要**多副本部署，保持今日「单 gateway 跑适配器」。
 
 ### 3.5 HPA
 
-```yaml
-metrics:
-- type: Resource      # CPU 70%
-- type: Pods
-  pods:
-    metric: hermes_queue_depth_ratio   # 当前深度 / 单 worker 吞吐基准
-    target: { type: AverageValue, averageValue: "50" }
-```
+CPU + 可选队列深度（Prometheus Adapter 仅样例清单）。扩的是 **增量** 请求与新会话；存量会话仍钉在 owner，直到 idle 逐出或 drain。缩容 = 迁移源：`stabilizationWindow` 宜 ≥ 300s，并盯 `session_migrations`。
 
-- 队列深度指标由 Phase 4 的 `/metrics` 提供，经 Prometheus Adapter 暴露。
-- 扩容触发后新 Pod 冷启动 < 60s（镜像预热 + 无状态启动）；缩容走 §3.2 优雅退出。
-- 注意：**缩容是会话迁移的主要来源**，配合 `hermes_session_migrations_total` 告警观测迁移风暴。
+---
 
-## 4. 发布策略
-
-| 项 | 设计 |
-|---|---|
-| 滚动升级 | maxSurge 1 / maxUnavailable 0（配合优雅退出，会话零中断目标） |
-| 灰度 | 单独 `gateway-canary` Deployment（1 副本，镜像新版本），Ingress 按 header/权重分流 5% 流量；观测 30min 指标后全量 |
-| 回滚 | Deployment revision 回滚 + 镜像不可变 tag；fencing 保证新旧版本混跑期间会话安全 |
-| PDB | minAvailable 1（防止维护操作同时杀全部副本） |
-
-## 5. 配置与清单
-
-### 新增文件（K8s 清单 + 代码）
-
-| 文件 | 用途 |
-|---|---|
-| `docker/k8s/gateway-deploy.yaml` | Deployment + Service + PDB + HPA |
-| `docker/k8s/redis-sentinel.yaml` | StatefulSet + sentinel 配置 |
-| `docker/k8s/adapter-pollers.yaml` | 长轮询 poller Deployment |
-| `docker/k8s/ingress.yaml` | Ingress + 灰度注解 |
-| `docker/k8s/prometheus-adapter.yaml` | 自定义指标管线 |
-| `gateway/leader_polling.py` | 适配器轮询循环的 leader 化改造（LockBackend 选主 + 入队） |
-| `gateway/admin_api.py` | `/healthz` `/admin/drain` 端点 |
-| `tests/e2e/test_k8s_drain.py` | kind 集群内 drain/接管演练 |
-
-### 配置段
+## 4. 配置与清单意向
 
 ```yaml
 cluster:
   k8s:
-    node_id_from: "pod_name"
-    drain_timeout_sec: 120
-  redis:
-    sentinel_hosts: "redis-0.redis:26379,..."
-    master_name: "hermes"
+    node_id_from: pod_name
+    drain_timeout_sec: 120   # 与 Phase 1 同一语义
   pollers:
-    enabled: true               # gateway 内嵌长轮询关闭，由独立 poller 承担
+    telegram: { enabled: false }   # 按平台开关，无全局 pollers.enabled 一把梭
 ```
 
-## 6. 实施步骤与验收
+清单目录（样例，非核心运行时）：
+
+- `docker/k8s/gateway-deploy.yaml`（Deployment/Service/PDB/HPA）
+- `docker/k8s/ingress.yaml`（含 canary 注解说明：只影响新会话）
+- `docker/k8s/configmap-secret.example.yaml`
+- 可选 `docker/k8s/poller-telegram.yaml`
+- kind 用 Redis/MinIO overlay
+
+代码意向：`gateway/admin_api.py` 若 Phase 1 已有 drain/healthz 则本阶段只接线；**按平台** 的 poller 入口放在对应 `gateway/platforms/` sibling，不造万能 `leader_polling.py`。
+
+测试：kind drain 演练可有；不要把「必须连得上公有云 K8s」当单测。
+
+---
+
+## 5. 实施步骤与验收
 
 | 步 | 内容 | 验证 |
 |---|---|---|
-| S1 | 镜像 + 清单 + kind 本地集群起全量 | 2 副本通过 Phase 1 全部验收用例 |
-| S2 | drain 改造 + 滚动升级 | 升级期间 1000 请求零 5xx；会话迁移延迟达标 |
-| S3 | Sentinel 切换演练 | kill 主 → 30s 内恢复；期间按降级策略运行不丢任务 |
-| S4 | poller 拆分 | Telegram 消息经 poller→队列→任意 gateway 消费，单副本语义保持 |
-| S5 | HPA 压测 | 负载拉升自动扩容、回落自动缩容；缩容无会话错误 |
-| S6 | 灰度演练 | canary 分流/回滚全流程 |
+| S1 | 镜像 + kind：ConfigMap/Secret + 2 replica + 托管或容器 Redis + MinIO | Phase 1 双节点用例仍过 |
+| S2 | preStop drain + 滚动 | drain 路径下 transcript 连续；允许 cache 变冷 |
+| S3 | 托管 Redis 故障（或模拟） | 按 Phase 2/4 fail_closed / 队列 503，不谎称成功 |
+| S4 | （可选）Telegram poller + 队列 | 单消费者；重复消息幂等 |
+| S5 | HPA | 扩容接新会话；缩容有 drain |
+| S6 | Canary | 新 session_key 按权重进 canary；老会话仍在 owner |
 
-**验收标准（项目终点）**：单 Pod 故障 60s 内无感接管；Redis 主切换 30s 内恢复且零数据丢失；滚动升级与缩容对在线会话零 5xx；队列积压驱动扩容实测有效。
+终点验收（诚实版）：
 
-## 7. 风险与边界
+- 单 Pod **drain 后删除**：另一副本接管，transcript 至最后快照。
+- 单 Pod **kill -9**：租约 TTL 内接管，可能丢未回写 turn。
+- 滚动升级走 drain，不承诺猝死级零 5xx。
+- emptyDir 重启：仅恢复已快照会话；cron 须 Phase 4 S0；工作区/memory 不在范围。
+
+---
+
+## 6. 风险
 
 | 风险 | 缓解 |
 |---|---|
-| 缩容/升级引发会话迁移风暴 | 迁移指标告警；HPA 缩容 stabilizationWindow ≥ 300s；drain 串行化（PDB） |
-| emptyDir 冷启动拉快照延迟 | 首请求同步拉取 + 异步预热；实测目标 < 2s |
-| Sentinel 切换期写入失败 | Phase 4 降级策略已覆盖；AOF everysec 丢数据 ≤1s 且不涉及会话本体 |
-| 长轮询 poller 单副本是可用性短板 | leader 选举 + 热备，故障 90s 内切换；平台侧消息有重投机制兜底 |
-| 会话亲和 + HPA 的天然张力（扩容不能分摊存量会话） | 文档化：HPA 主要应对**增量**会话；存量均衡靠空闲逐出后自然再分布 |
+| 缩容迁移风暴 | HPA 窗口、PDB、迁移指标 |
+| 把 emptyDir 当成完整 HERMES_HOME | 清单强制拆开 config/secret 挂载；文档禁止「空目录冷启动一切」 |
+| Canary 被亲和「吸回」旧版 | 发布说明只统计新会话 |
+| 长轮询 poller 单点 | 选主热备；能 webhook 的平台优先 webhook |
+| 自建 Sentinel 运维 | 生产不默认交付 |

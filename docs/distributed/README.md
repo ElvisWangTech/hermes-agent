@@ -1,38 +1,58 @@
 # Hermes 分布式改造 · 设计文档索引
 
-> 目标：多用户专属 Agent、用户隔离、可水平扩展，渐进式交付，每阶段产出可验证版本。
-> 核心原则：**最小改动**——所有分布式能力可选配置，`cluster.enabled=false` 时行为与单体现状完全一致。
+> 目标：Gateway 可水平扩展；多用户隔离在后续阶段按现有 **profile** 模型叠加，不另起炉灶。
+> 核心原则：所有分布式能力可选；`cluster.enabled=false` 时与单体现状完全一致。
+>
+> **先读 [Phase 0](phase0-design.md)。** 身份与「源 / 缓存 / 不同步」未确认前，不要实施 Phase 1–5。
 
-## 关键架构决策（已确认）
+---
 
-| 决策点 | 结论 |
-|---|---|
-| 状态存储路线 | 会话亲和（Redis 租约 + fencing）+ 对象存储快照；SQLite 保留为节点热缓存 |
-| 对象存储 | 七牛云 Kodo（S3 兼容协议，boto3 直连，可配置切换任意 S3 兼容厂商） |
-| 服务入口 | HTTP API 优先（现有 OpenAI 兼容 api_server）；消息平台长轮询延后至 Phase 5 |
-| 协调层 | `coordination/` 包三接口（LockBackend / SessionRouter / ConfigStore），local + redis 双实现 |
+## 架构决策
+
+| 决策点 | 结论 | 状态 |
+|---|---|---|
+| 状态存储 | 会话亲和（Redis 租约 + fencing）+ 对象存储快照；SQLite 仅节点热缓存 | 方向确认；**协议以 Phase 1 v1.1 为准**（旧稿 generation 比较与 skip-import 作废） |
+| 对象存储 | S3 兼容协议（boto3）；默认对接七牛 Kodo，可换任意兼容端点 | 确认（不绑厂商 SDK） |
+| 服务入口 | HTTP API 优先（现有 OpenAI 兼容 api_server）；长轮询平台延后 | 确认 |
+| 身份 | `agent_id = profile`；亲和键 = `session_key`；快照键 = session lineage | 见 Phase 0 |
+| 协调层 | `gateway/coordination/`：Phase 1 只放 SessionRouter + 快照。不含 ConfigStore / 本地 `cluster.db` | 修正：旧「三接口 + cluster.db」撤回 |
+| Redis HA | 对公网或多副本生产之前使用**托管 Redis**；不把自建 Sentinel 当 Phase 5 才补的前提 | 修正 |
+| 共享状态 | 节点 SQLite / `jobs.json` / 进程 dict **不是**集群源 | 见 Phase 0 清单 |
+
+---
 
 ## 阶段文档
 
 | 阶段 | 文档 | 内容 | 状态 |
 |---|---|---|---|
-| Phase 1 | [phase1-design.md](phase1-design.md) | 无状态化底座：协调层抽象、会话亲和、快照同步（fencing 防脑裂）、归属校验、日志埋点 | 待确认 |
-| Phase 2 | [phase2-design.md](phase2-design.md) | 安全与租户管控：API Key/HMAC 签名、表驱动授权、Redis 令牌桶限流、token 配额与用量审计 | 待确认 |
-| Phase 3 | [phase3-design.md](phase3-design.md) | 工具安全解耦（可选）：工具分级、高危工具 RPC 沙箱、资源限额与逃逸防护 | 待确认（可跳过） |
-| Phase 4 | [phase4-design.md](phase4-design.md) | 可靠性与可观测：Redis Streams 队列（重试/死信/超时）、cron 迁移、Trace/Metrics/告警 | 待确认 |
-| Phase 5 | [phase5-design.md](phase5-design.md) | 云原生：K8s 清单、Redis Sentinel、HPA、优雅退出/灰度、长轮询适配器 leader 化 | 待确认 |
+| Phase 0 | [phase0-design.md](phase0-design.md) | 身份映射、状态清单、键前缀、加载器 | 设计修正稿 |
+| Phase 1 | [phase1-design.md](phase1-design.md) | 亲和路由、快照协议、内部反代、drain、日志四元组 | 设计修正稿 |
+| Phase 2 | [phase2-design.md](phase2-design.md) | Bearer 鉴权、Redis 限流/配额；不改消息平台 authz | 设计修正稿 |
+| Phase 3 | [phase3-design.md](phase3-design.md) | **默认跳过**；若做则强制现有 terminal backend | 设计修正稿（可跳过） |
+| Phase 4 | [phase4-design.md](phase4-design.md) | 外置 cron store 后上队列；观测接现有 OTLP | 设计修正稿 |
+| Phase 5 | [phase5-design.md](phase5-design.md) | K8s、配置/密钥挂载、按平台 poller、HPA | 设计修正稿 |
 
 ## 阶段依赖
 
 ```
-Phase 1（底座）
-   ├──► Phase 2（安全）────────┐
-   ├──► Phase 3（沙箱，可选）   ├──► Phase 5（云原生）
-   └──► Phase 4（队列/观测）───┘
+Phase 0（身份 + 状态清单）
+   └──► Phase 1（亲和 + 快照 + drain）
+          ├──► Phase 2（API 鉴权 / 限流）──┐
+          ├──► Phase 3（可选，默认跳过）    ├──► Phase 5（K8s）
+          └──► Phase 4（cron 外置 + 队列 + 观测）─┘
 ```
+
+Phase 2「对公网开放」的前提：托管 Redis 可用 + `/healthz` 能反映 Redis/对象存储，而不是等 Phase 5。
+
+---
 
 ## 贯穿性约定
 
-1. **可回滚**：每个阶段默认配置关闭，单体用户零影响；每阶段内部分 S1–Sn 步，每步独立验证。
-2. **组件最小化**：全程只引入两个外部组件——Redis（协调 + 队列）与对象存储（快照）。
-3. **prompt 缓存与核心 invariant 不受破坏**：所有改动在入口管线与协调层，agent 核心与工具 schema 不变。
+1. **可回滚**：每阶段默认关闭；阶段内 S1–Sn 可独立验证。
+2. **组件**：只引入 Redis（协调 / 计数 / 队列）与对象存储（快照）。权威数据不放节点 SQLite。
+3. **Profile 作用域**：一个进程多个 home；Redis/S3/锁按 `hermes_home_key()` 分区。Gateway 与 CLI 两套 config 加载器都要解析 `cluster.*`。
+4. **Prompt 缓存**：改动停在入口与协调层，不改工具 schema。会话迁移后允许缓存变冷。
+5. **OpenAI 兼容**：默认鉴权保持 `Authorization: Bearer`。
+6. **观测**：扩展现有 `monitoring.export.otlp`；带 user 的用量标签须配置门 / opt-in。
+7. **代码形状**：新逻辑进 sibling 或 `gateway/coordination/`，不往 `run.py` / `api_server.py` facade 堆。依赖带上界。
+8. **只改设计直至确认**：本文档树是实施前置；确认前不落地代码。
