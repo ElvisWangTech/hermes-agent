@@ -1,6 +1,6 @@
 # Hermes 分布式改造 · Phase 5 详细设计
 
-> 版本：v1.1（修正稿） ｜ 状态：待确认 ｜ 前置：[Phase 1](phase1-design.md) drain + 快照 replace；[Phase 4](phase4-design.md) S0（若该集群跑 cron）。[Phase 3](phase3-design.md) 默认跳过。
+> 版本：v1.2 ｜ 状态：待确认 ｜ 前置：[Phase 1](phase1-design.md) drain + 快照 replace；[Phase 4](phase4-design.md) S0（若该集群跑 cron）。[Phase 3](phase3-design.md) 默认跳过。
 >
 > 目标一句话：用 K8s 跑多副本 api_server；配置与密钥可挂载；托管 Redis + 对象存储；长轮询按 **平台** 拆 leader；HPA 只对增量会话有意义。
 >
@@ -59,7 +59,7 @@
 | 副本 | 初始 2，HPA 2–10 |
 | 镜像 | 与今日 gateway 同一入口；`cluster.enabled=true` |
 | 探针 | readiness：进程 + Redis + 对象存储头探 + 本节点能续自己的 node:addr；liveness：进程存活（避免误杀触发迁移风暴） |
-| `node_id` | `POD_NAME`（Downward API） |
+| 节点身份 | POD_NAME + 每次启动新 incarnation |
 | 存储 | emptyDir 仅 `state.db` 热缓存；**HERMES_HOME 的 config/skills 只读挂载**；`.env` 来自 Secret |
 | Profile | 多 profile = 多套 home 挂载或多个 Deployment；禁止一个空目录冒充 multiplex 的全部 home |
 
@@ -68,20 +68,26 @@
 Phase 1 已规定 drain。K8s：
 
 1. `preStop` 调 `/admin/drain`（内部 token）。
-2. `terminationGracePeriodSeconds` > `drain_timeout_sec`。
+2. `terminationGracePeriodSeconds` > `drain_timeout_sec` + 快照提交/网络重试余量。
 3. 滚动：`maxUnavailable: 0`、`maxSurge: 1`；PDB 至少保证 1 个就绪副本（生产建议更高）。
 
-**Canary：** Ingress 权重/header 只影响 **尚未 claim 的新 session_key**。已绑定的会话仍由 SessionRouter 送到 owner（可能是稳定版 Pod）。文档与发布检查单必须写清：灰度指标看新会话错误率，不要用「总流量 5%」解释亲和流量。混跑期间靠 fencing，不靠版本协商。
+**Canary：** Ingress 权重/header 只影响 **尚未 claim 的新 session_key**。已绑定的会话仍由 SessionRouter 送到 owner（可能是稳定版 Pod）。文档与发布检查单必须写清：灰度指标看新会话错误率，不要用「总流量 5%」解释亲和流量。混跑必须同时满足 fencing 与数据版本兼容：manifest 带 schema_version/min_reader_version，明确 N/N−1 可读写窗口；旧版不能读取的新格式不得在仍可能被旧版接管时发布。fencing 只防失权写入，不能替代版本协商。
 
 **「零 5xx」**：只对 drain 成功的滚动承诺；猝死/Redis 抖动走 Phase 1/4 降级，不得写进同一验收句。
 
-### 3.3 Redis
+### 3.3 回滚与灾备
+
+关闭 `cluster.enabled` 不是数据回滚。步骤：停外部写入 → drain 所有 owner/worker/poller → 确认 manifest 提交或列明未提交损失 → 将已提交 conversation 导入目标单体 home 并重建绑定 → 恢复 cron/权限配置 → 切入口。恢复过程验证会话数量/lineage/哈希和代表性续聊；未迁移工作区/memory 的限制继续有效。
+
+Redis 回退到旧备份必须先隔离所有旧进程及连接，按 Phase 0 受控恢复；快照孤儿对象不可自动作为新头。记录 RPO/RTO 与恢复演练结果，不把“托管实例可连接”当数据恢复验收。
+
+### 3.4 Redis
 
 生产：云厂商托管 Redis，应用侧 `REDIS_URL`（sentinel/cluster 以厂商 SDK 为准，需要时再扩展 `redis_backend.py`）。
 
 kind：可用单容器 Redis。不要把「1 主 2 从 3 哨兵 StatefulSet」当默认交付物。
 
-### 3.4 长轮询 / 网关型平台（按平台，不要一个文件包打）
+### 3.5 长轮询 / 网关型平台（按平台，不要一个文件包打）
 
 问题仍成立：Telegram `getUpdates` 单消费者。
 
@@ -95,7 +101,7 @@ kind：可用单容器 Redis。不要把「1 主 2 从 3 哨兵 StatefulSet」�
 
 未启用 Phase 4 队列时：poller **不要**多副本部署，保持今日「单 gateway 跑适配器」。
 
-### 3.5 HPA
+### 3.6 HPA
 
 CPU + 可选队列深度（Prometheus Adapter 仅样例清单）。扩的是 **增量** 请求与新会话；存量会话仍钉在 owner，直到 idle 逐出或 drain。缩容 = 迁移源：`stabilizationWindow` 宜 ≥ 300s，并盯 `session_migrations`。
 
@@ -140,7 +146,7 @@ cluster:
 终点验收（诚实版）：
 
 - 单 Pod **drain 后删除**：另一副本接管，transcript 至最后快照。
-- 单 Pod **kill -9**：租约 TTL 内接管，可能丢未回写 turn。
+- 单 Pod **kill -9**：租约到期后接管，另计恢复耗时；可能丢多轮未提交增量。
 - 滚动升级走 drain，不承诺猝死级零 5xx。
 - emptyDir 重启：仅恢复已快照会话；cron 须 Phase 4 S0；工作区/memory 不在范围。
 

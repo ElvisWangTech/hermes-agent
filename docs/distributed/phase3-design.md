@@ -1,6 +1,6 @@
 # Hermes 分布式改造 · Phase 3 详细设计（默认跳过）
 
-> 版本：v1.1（修正稿） ｜ 状态：待确认 ｜ 前置：无硬依赖
+> 版本：v1.2 ｜ 状态：待确认 ｜ 前置：无硬依赖
 >
 > **默认建议：跳过本阶段。** 多租户隔离应复用已有 `tools/environments/`（docker / ssh / modal / daytona / singularity），而不是再做一套「每工具 gRPC + 一次性容器」。
 >
@@ -44,6 +44,10 @@ Footprint：新能力应落在 environment 表上的新 provider，或运维强�
 3. 文档告知：会话迁移后工作区不跟随（Phase 0）；要持久盘就用 backend 自己的 volume（docker volume、modal 盘等），不要指望 Phase 1 快照。
 
 无需新包、无新工具 schema、prompt 缓存不受影响。
+
+**跳过新增沙箱代码不等于跳过隔离验收。** 不可信多租户公网开放前必须用现有 backend 验证文件/终端共享正确隔离的工作区、浏览器/插件/委托与后台回调不越过租户边界，凭证和网络出口满足部署策略。仅设置 terminal.backend 不能自动证明全部工具都被隔离；不能满足的工具须按会话能力配置禁用，或另行实施 provider，不假称已完成多租户隔离。
+
+持久 volume 必须按稳定 cluster profile/conversation 身份映射，节点本地 docker volume 并不自动跨节点可达。故障迁移只能承诺 backend 实际支持的状态恢复。
 
 ---
 

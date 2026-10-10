@@ -11,10 +11,10 @@
 
 | 决策点 | 结论 | 状态 |
 |---|---|---|
-| 状态存储 | 会话亲和（Redis 租约 + fencing）+ 对象存储快照；SQLite 仅节点热缓存 | 方向确认；**协议以 Phase 1 v1.1 为准**（旧稿 generation 比较与 skip-import 作废） |
+| 状态存储 | Redis 原子提交 conversation manifest；S3 不可变快照；SQLite 热缓存 | **以 Phase 1 v1.2 为准**；epoch/revision 分离，非回退假设须验证 |
 | 对象存储 | S3 兼容协议（boto3）；默认对接七牛 Kodo，可换任意兼容端点 | 确认（不绑厂商 SDK） |
 | 服务入口 | HTTP API 优先（现有 OpenAI 兼容 api_server）；长轮询平台延后 | 确认 |
-| 身份 | `agent_id = profile`；亲和键 = `session_key`；快照键 = session lineage | 见 Phase 0 |
+| 身份 | namespace + profile_id 映射本地 home；conversation 稳定，tip 可旋转 | 本地 hermes_home_key 不作为集群身份 |
 | 协调层 | `gateway/coordination/`：Phase 1 只放 SessionRouter + 快照。不含 ConfigStore / 本地 `cluster.db` | 修正：旧「三接口 + cluster.db」撤回 |
 | Redis HA | 对公网或多副本生产之前使用**托管 Redis**；不把自建 Sentinel 当 Phase 5 才补的前提 | 修正 |
 | 共享状态 | 节点 SQLite / `jobs.json` / 进程 dict **不是**集群源 | 见 Phase 0 清单 |
@@ -34,23 +34,25 @@
 
 ## 阶段依赖
 
-```
-Phase 0（身份 + 状态清单）
-   └──► Phase 1（亲和 + 快照 + drain）
-          ├──► Phase 2（API 鉴权 / 限流）──┐
-          ├──► Phase 3（可选，默认跳过）    ├──► Phase 5（K8s）
-          └──► Phase 4（cron 外置 + 队列 + 观测）─┘
+```text
+Phase 0（稳定身份 + 状态/端点契约）
+   └──► Phase 1（原子提交 + 冷恢复 + drain + 基础观测）
+          ├──► 内网双副本故障演练 ──► Phase 2（公网准入/软配额）
+          ├──► Phase 4（按需 cron/Streams）
+          └──► Phase 5（API-only K8s 可先做）
+Phase 3：可跳过新增代码；不可信租户隔离验收不可跳过
+Phase 5 cron 依赖 Phase 4 S0；独立 poller 依赖 Phase 4 队列
 ```
 
-Phase 2「对公网开放」的前提：托管 Redis 可用 + `/healthz` 能反映 Redis/对象存储，而不是等 Phase 5。
+公网前提：Redis 持久性/非回退假设经验证，健康探针可反映依赖，基础监控及隔离验收完成。托管 HA 不自动等于无丢写；不满足协议假设须停写受控恢复。
 
 ---
 
 ## 贯穿性约定
 
-1. **可回滚**：每阶段默认关闭；阶段内 S1–Sn 可独立验证。
-2. **组件**：只引入 Redis（协调 / 计数 / 队列）与对象存储（快照）。权威数据不放节点 SQLite。
-3. **Profile 作用域**：一个进程多个 home；Redis/S3/锁按 `hermes_home_key()` 分区。Gateway 与 CLI 两套 config 加载器都要解析 `cluster.*`。
+1. **可回滚**：默认关闭不影响原单体；已运行集群回退须停写、drain、导入已提交数据再切入口，不是只关开关。
+2. **组件**：Redis 是权威元数据/权限/cron/队列面，S3 存不可变内容；明确 RPO/RTO、noeviction 与灾备，权威数据不放节点 SQLite。
+3. **Profile 作用域**：本地 hermes_home_key 隔离，集群按 namespace/profile_id 分区；Gateway 与 CLI 都解析 cluster 配置。
 4. **Prompt 缓存**：改动停在入口与协调层，不改工具 schema。会话迁移后允许缓存变冷。
 5. **OpenAI 兼容**：默认鉴权保持 `Authorization: Bearer`。
 6. **观测**：扩展现有 `monitoring.export.otlp`；带 user 的用量标签须配置门 / opt-in。
