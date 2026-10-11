@@ -590,6 +590,15 @@ printf '%s\n' '{"schema":"hermes-build-local-v1"}' > "$MARKER"
 
 export HERMES_HOME="$HERMES_HOME_DIR"
 export HERMES_RUNTIME_DIR="$STORE"
+# Keep build tools from consulting or updating per-user configuration and
+# caches. HERMES_HOME isolates Hermes itself; these XDG/npm paths isolate the
+# npm/uv/frontend subprocesses that otherwise default to $HOME.
+export XDG_CONFIG_HOME="$OUT/cache/config"
+export XDG_CACHE_HOME="$OUT/cache/xdg"
+export npm_config_userconfig="$OUT/cache/npmrc"
+export npm_config_cache="$OUT/cache/npm"
+export ELECTRON_CACHE="$OUT/cache/electron"
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$npm_config_cache" "$ELECTRON_CACHE"
 
 printf "\n${C_CYAN}☤ Hermes local dev build${C_NC}\n"
 dim "  repo         $REPO"

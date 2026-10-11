@@ -1,0 +1,9 @@
+{
+  "name": "随身",
+  "short_name": "随身",
+  "start_url": "/pocket/",
+  "display": "standalone",
+  "background_color": "#1a1410",
+  "theme_color": "#1a1410",
+  "lang": "zh-CN"
+}

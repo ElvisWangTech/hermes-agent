@@ -1,8 +1,8 @@
 # Hermes Pocket：需求与页面方案
 
-> 状态：待确认。这一步只定需求和页面，不写客户端、不改 `hermes serve`。
+> 状态：第一版在 `apps/pocket`，由 `hermes serve` 挂在 `/pocket`。仓库里还没有 `.inp` 模型，所以形象先用随包画像和 CSS 动作，画面接口留着，模型到了再换成 Inochi2D。
 >
-> 需求与效果图放在本目录（与 `docs/distributed/` 一类的设计文档同级，不进 `website/docs`）。以后的客户端代码放在 `apps/pocket`。
+> 需求与效果图放在本目录（与 `docs/distributed/` 一类的设计文档同级，不进 `website/docs`）。客户端代码在 `apps/pocket`。
 
 工作名 **Hermes Pocket**。
 
@@ -119,6 +119,6 @@ Inochi2D 本体是 BSD 2-Clause。可以放进要发布的客户端，免费，�
 13. 横屏：[pocket-ui-landscape.jpg](pocket-ui-landscape.jpg)
 14. 语音还没准备好，可以打字：[pocket-ui-text.jpg](pocket-ui-text.jpg)
 
-## 确认之后才做的实现（本次不动）
+## 这一版怎么接上
 
-页面确认后，再用 Vite + React 做 PWA。形象用 Inochi2D 的官方 WebAssembly 运行时播随包的 `.inp` 模型，发行物带上 BSD LICENSE。对话复用 `@hermes/shared` 的 JSON-RPC 客户端：建会话、提交一句、订阅文字增量当字幕；麦克风在浏览器里录，听写和朗读走 serve 已有的音频接口。会话来源标成 pocket，不借用桌面端专属工具。
+页面是 Vite + React，开发时 `npm run dev --workspace @hermes/pocket`，打包后由 serve 在 `/pocket` 提供。名字在第一次 `session.create` 之前写入该身份的 `MEMORY.md`（`POST /api/pocket/name`）。对话复用 `@hermes/shared` 的 JSON-RPC 客户端，会话来源是 `pocket`。麦克风在浏览器里录，听写和朗读走已有的音频接口。字幕按句子排队朗读。Inochi2D 的 WebAssembly 运行时和 `.inp` 还不在仓库里，这一版不带 Cubism，也不带官方示例模型。

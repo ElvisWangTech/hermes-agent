@@ -1004,6 +1004,7 @@ from hermes_cli.web_routers import (  # noqa: E402
     chat_ws as _chat_ws_routes,
     chat_workspaces as _chat_workspaces_routes,
     dashboard_ui as _dashboard_ui_routes,
+    pocket as _pocket_routes,
 )
 
 app.include_router(_files_routes.router)
@@ -1044,6 +1045,10 @@ _mount_plugin_api_routes()
 from hermes_cli.dashboard_auth.routes import router as _dashboard_auth_router  # noqa: E402
 
 app.include_router(_dashboard_auth_router)
+app.include_router(_pocket_routes.router)
+from hermes_cli.pocket_pages import mount_pocket  # noqa: E402
+
+mount_pocket(app)
 mount_spa(app)
 
 
