@@ -1790,6 +1790,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
+        from gateway.platforms.api_server_cluster import cluster_route_table
+        routes.extend(cluster_route_table(self))
         return routes
 
     # -- Session header helpers -------------------------------------------------------
@@ -2450,7 +2452,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     # -- HTTP handlers ----------------------------------------------------------------
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
-        """GET /health — simple health check."""
+        """GET /health — simple health check. A cluster drain fails readiness."""
+        from gateway.coordination.drain import health_payload
+        blocked = health_payload()
+        if blocked is not None:
+            return web.json_response(blocked, status=503)
         return web.json_response({"status": "ok", "platform": "hermes-agent", "version": _hermes_version()})
 
     @_require_auth
@@ -2462,7 +2468,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         runtime = read_runtime_status() or {}
         gw_state = runtime.get("gateway_state")
         gw_active = parse_active_agents(runtime.get("active_agents", 0))
-# Serve the live adapter's own metrics alongside the persisted platform map: the
+        # Serve the live adapter's own metrics alongside the persisted platform map: the
         # heartbeat loop keeps the file fresh, but a just-booted or wedged writer would
         # otherwise show boot-time values here too (#52323).
         platforms = runtime.get("platforms", {})
@@ -2482,8 +2488,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             configured_model=_resolve_gateway_model(), runtime_status=runtime,
             active_api_runs=active_api_runs, process_completion_queue_depth=process_depth,
             active_delegations=active_delegations)
-        return web.json_response({
-"status": readiness["status"], "readiness": readiness, "platform": "hermes-agent",
+        payload = {
+            "status": readiness["status"], "readiness": readiness, "platform": "hermes-agent",
             "version": _hermes_version(), "gateway_state": gw_state,
             "platforms": platforms,
             "api_server": api_status,
@@ -2496,7 +2502,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 gateway_running=True, gateway_state=gw_state),
             "exit_reason": runtime.get("exit_reason"),
             # Contract: RFC3339 string | null, never a number (legacy epoch floats exist).
-            "updated_at": normalize_updated_at(runtime.get("updated_at")), "pid": os.getpid()})
+            "updated_at": normalize_updated_at(runtime.get("updated_at")), "pid": os.getpid(),
+        }
+        from gateway.coordination.config import cluster_enabled
+        if cluster_enabled():
+            from gateway.coordination.metrics import snapshot as cluster_snapshot
+            payload["cluster"] = cluster_snapshot()
+        return web.json_response(payload)
 
     @_require_auth
     async def _handle_models(self, request: "web.Request") -> "web.Response":
@@ -4486,9 +4498,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 retryable=False)
             return False
         try:
+            from gateway.coordination.errors import ClusterConfigError
+            from gateway.platforms.api_server_cluster import cluster_http_middleware, ensure_cluster_started
+            try:
+                ensure_cluster_started()
+            except ClusterConfigError as exc:
+                self._set_fatal_error("cluster_not_ready", str(exc), retryable=False)
+                return False
             mws = [mw for mw in (
                 self._make_profile_prefix_middleware(), cors_middleware, body_limit_middleware,
-                security_headers_middleware) if mw is not None]
+                security_headers_middleware, cluster_http_middleware()) if mw is not None]
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             assert self._app is not None
             # Native routes + multiplex /p/<profile>/ mirrors (the prefix middleware validates and

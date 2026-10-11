@@ -16,6 +16,14 @@ from typing import Callable, TypeVar
 _T = TypeVar("_T")
 _ATTEMPTS = 4
 _MAX_DELAY = 30.0
+
+# The PM worker is a child process with no log handlers, and it inherits the
+# parent's terminal. logging.lastResort would write this warning at the
+# cursor, into the CLI input line. A NullHandler still propagates to a real
+# handler when the caller configured one (the CLI's file log).
+_pm_logger = logging.getLogger("pm")
+if not any(isinstance(handler, logging.NullHandler) for handler in _pm_logger.handlers):
+    _pm_logger.addHandler(logging.NullHandler())
 _HTTP_RETRY = frozenset({408, 429, 500, 502, 503, 504})
 _NETWORK_ERRNOS = frozenset({
     errno.ECONNABORTED, errno.ECONNREFUSED, errno.ECONNRESET,

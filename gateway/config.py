@@ -820,7 +820,25 @@ def load_gateway_config() -> GatewayConfig:
     config = GatewayConfig.from_dict(gw_data)
     _apply_env_overrides(config)
     _validate_gateway_config(config)
+    _note_cluster_config()
     return config
+
+
+def _note_cluster_config() -> None:
+    """Parse ``cluster.*`` from the same YAML this loader just read.
+
+    The CLI sees the key through ``DEFAULT_CONFIG``. The gateway must parse the
+    raw section too, or an enabled cluster is a silent default on this path.
+    Dependency checks stay on api_server startup.
+    """
+    try:
+        from gateway.coordination.config import load_cluster_config
+        cfg = load_cluster_config()
+    except Exception:
+        logger.warning("cluster config could not be parsed; treating it as disabled", exc_info=True)
+        return
+    if cfg.enabled:
+        logger.info("cluster.enabled namespace=%s profile_id=%s", cfg.namespace, cfg.profile_id)
 
 
 def _validate_gateway_config(config: "GatewayConfig") -> None:

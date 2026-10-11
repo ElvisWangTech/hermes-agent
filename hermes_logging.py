@@ -223,6 +223,21 @@ def _quiet_noisy_loggers() -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
+def _cluster_log_tag() -> str:
+    """Four-tuple suffix when a cluster request set the context. Empty otherwise.
+
+    Logging must keep working if the agent package cannot be imported.
+    """
+    try:
+        from agent.log_context import cluster_log_tag
+    except Exception:
+        return ""
+    try:
+        return cluster_log_tag()
+    except Exception:
+        return ""
+
+
 def set_session_context(session_id: str) -> None:
     """Set the session ID for the current thread."""
     _session_context.session_id = session_id
@@ -247,7 +262,9 @@ def _install_session_record_factory() -> None:
     def _session_record_factory(*args, **kwargs):
         record = current_factory(*args, **kwargs)
         sid = getattr(_session_context, "session_id", None)
-        record.session_tag = f" [{sid}]" if sid else ""  # type: ignore[attr-defined]
+        tag = f" [{sid}]" if sid else ""
+        tag += _cluster_log_tag()
+        record.session_tag = tag  # type: ignore[attr-defined]
         # QueueListener formats on its own thread, after the profile-scoped
         # ContextVar is gone; keep the resolved home on the record so a
         # multiplex desktop ticker can route to the job owner's files (#97489).

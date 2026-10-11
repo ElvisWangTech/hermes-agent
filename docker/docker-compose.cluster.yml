@@ -1,0 +1,79 @@
+# Phase 1 acceptance topology: two api_server replicas, Redis, and MinIO.
+# Local state.db volumes are hot caches. The manifest lives in Redis and the
+# transcript blobs live in the bucket. `cluster.enabled` in each home's
+# config.yaml turns the path on; leaving it false is the single-node process.
+#
+# Build from the repo root:
+#   docker compose -f docker/docker-compose.cluster.yml up --build
+#
+# Each replica needs the same namespace and profile_id, its own POD_NAME, and
+# the shared secrets below. Point proxy.allow_hosts at the other replica.
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: minio/minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+
+  minio-init:
+    image: minio/mc
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done
+        mc mb -p local/hermes || true
+
+  gateway-a:
+    build:
+      context: ..
+    environment: &gateway_env
+      HERMES_HOME: /var/hermes
+      API_SERVER_HOST: 0.0.0.0
+      API_SERVER_PORT: "8642"
+      API_SERVER_KEY: dev-api-server-key-0123456789abcdef
+      REDIS_URL: redis://redis:6379/0
+      CLUSTER_INTERNAL_TOKEN: dev-cluster-internal-token
+      OBJECT_STORE_ACCESS_KEY: minioadmin
+      OBJECT_STORE_SECRET_KEY: minioadmin
+      POD_NAME: gateway-a
+    command: ["hermes", "gateway", "run"]
+    volumes:
+      - home-a:/var/hermes
+      - ./cluster/config.yaml:/var/hermes/config.yaml:ro
+    depends_on:
+      - redis
+      - minio-init
+    ports:
+      - "8642:8642"
+
+  gateway-b:
+    build:
+      context: ..
+    environment:
+      <<: *gateway_env
+      POD_NAME: gateway-b
+    command: ["hermes", "gateway", "run"]
+    volumes:
+      - home-b:/var/hermes
+      - ./cluster/config.yaml:/var/hermes/config.yaml:ro
+    depends_on:
+      - redis
+      - minio-init
+    ports:
+      - "8643:8642"
+
+volumes:
+  home-a:
+  home-b:

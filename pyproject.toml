@@ -441,6 +441,13 @@ otlp = [
 ]
 langfuse = ["langfuse==4.15.2"]
 bedrock = ["boto3==1.42.89"]
+# Optional multi-replica api_server: Redis coordination, S3-compatible snapshots, zstd.
+# Not in [all]. An enabled cluster refuses to start until this extra is installed.
+cluster = [
+  "redis>=5,<7",
+  "boto3>=1.34,<2",
+  "zstandard>=0.22,<0.24",
+]
 vertex = ["google-auth==2.55.1"]
 azure-identity = ["azure-identity==1.25.3"]
 termux = [
@@ -770,6 +777,7 @@ python-telegram-bot = false
 pyyaml = false
 qrcode = false
 requests = false
+resvg-py = false
 rich = false
 ruamel-yaml = false
 ruff = false

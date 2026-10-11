@@ -1,138 +1,163 @@
 #!/usr/bin/env bash
 # =============================================================================
-# build-local.sh — 在当前 checkout 内「编译 + 安装」Hermes 开发版
+# build-local.sh — build and install a Hermes dev checkout in place
 # =============================================================================
-# 与官方 install.sh（把源码 clone 到 ~/.hermes/hermes-agent）不同，本脚本就地
-# 使用当前工作区，所有产物收敛到仓库根目录下的 .build/：
+# Unlike scripts/install.sh (which clones into ~/.hermes/hermes-agent), this
+# script uses the current workspace and writes every artifact under .build/:
 #
 #   .build/
-#   ├── bin/                       hermes / hermes-acp 启动器（绑定本 checkout）
-#   ├── hermes-home/               隔离的 HERMES_HOME（配置 / 会话 / 依赖代）
-#   ├── products/tui/              TUI 编译产物   —— dist/entry.js
-#   ├── products/web/              仪表盘产物     —— index.html + assets
-#   ├── products/desktop/          桌面端产物     —— 仅 --with-desktop
-#   ├── icons/                     生成的图标     —— Web/桌面端编译输入
-#   ├── activate.sh                source 它即可把本环境装进当前 shell
-#   ├── build-manifest.json        本次构建清单（可追溯）
-#   └── .hermes-build-local.json   本脚本的目录归属标记（供 --clean 判断）
+#   ├── bin/                       hermes / hermes-acp launchers (this checkout)
+#   ├── hermes-home/               isolated HERMES_HOME (config / sessions / installs)
+#   ├── products/tui/              TUI build            —— dist/entry.js
+#   ├── products/web/              dashboard build      —— index.html + assets
+#   ├── products/desktop/          desktop build        —— only with --with-desktop
+#   ├── icons/                     generated icons      —— web/desktop build input
+#   ├── activate.sh                source this to enter the dev environment
+#   ├── build-manifest.json        manifest for this build
+#   └── .hermes-build-local.json   ownership marker (required by --clean)
 #
-# 设计要点：
-#   1. Python 侧不编译。所谓「构建」= PM 按 pm/lock.json + uv.lock 引导运行时。
-#      setup.py 显式禁用了 wheel/sdist，`pip install .` / `uv build` 必然失败。
-#   2. 真正编译的只有 JS 前端：TUI / Dashboard /（可选）Electron 桌面端。
-#   3. HERMES_HOME 与 HERMES_RUNTIME_DIR 隔离在 .build/ 内，不碰 ~/.hermes 中
-#      已有的正式安装（唯一例外：复用其工具 store，见 --isolated-store）。
-#   4. 前端产物通过 HERMES_TUI_DIR / HERMES_WEB_DIST 被应用直接识别，因此
-#      无需往 checkout 里回写 ui-tui/dist 或 hermes_cli/web_dist。
-#   5. 全程不需要 clone。本脚本就地使用当前工作区，不做任何 git clone / git
-#      fetch / 远端交互：git 只用于把 HEAD 与分支记进构建清单，且失败时降级为
-#      unknown（即残缺的、没有 .git 的源码副本同样能构建）。
-#      依赖侧也没有 git 拉取——pm/lock.json 的 21 个工具全部是 url + sha256
-#      制品；uv.lock 里两个 git 源依赖在本机均不生效（psutil 仅 android；
-#      misaki 属 kittentts 可选 extra，默认不装）。macOS 的 pin 集不含 git
-#      工具包（它是 Windows 专用制品），系统 git 仅作可选前提。
-#      对照：官方 scripts/install.sh 必须 clone（或对已有 checkout 执行
-#      git fetch + stash + reset --hard），且没有离线开关。
+# Design:
+#   1. Python is not compiled. "Build" means PM bootstraps a runtime from
+#      pm/lock.json + uv.lock. setup.py disables wheel/sdist, so
+#      `pip install .` / `uv build` fail on purpose.
+#   2. The only compiled pieces are the JS frontends: TUI, Dashboard, and
+#      (optional) the Electron desktop app.
+#   3. HERMES_HOME and HERMES_RUNTIME_DIR both live under .build/. The tool
+#      store is always <out>/tools. CPython and the rest of the toolchain
+#      install there. This script does not read or write ~/.hermes.
+#   4. Frontends are picked up via HERMES_TUI_DIR / HERMES_WEB_DIST, so the
+#      script never writes ui-tui/dist or hermes_cli/web_dist back into the
+#      checkout.
+#   5. No clone. The script uses the current workspace and never runs
+#      git clone / git fetch. git is used only to record HEAD and the branch
+#      in the manifest, and a failure becomes "unknown" (a tree without .git
+#      still builds). Dependencies are not fetched via git either: the tools
+#      in pm/lock.json are url + sha256 artifacts. The two git-sourced deps
+#      in uv.lock do not apply here (psutil is Android-only; misaki is an
+#      optional kittentts extra and is not installed by default). The macOS
+#      pin set has no git tool package (that artifact is Windows-only);
+#      system git is an optional prerequisite.
+#      Contrast: scripts/install.sh must clone (or git fetch + stash +
+#      reset --hard on an existing checkout) and has no offline switch.
 #
-# 与生产安装（~/.hermes）的隔离：
-#   本脚本对「本机是否已有正式安装」两种情况都成立：
-#     · 有正式安装：下面是一整套硬性防呆 + 事后核验，绝不写进 ~/.hermes
-#       （例外：共享工具 store，见文末）；与生产共存时不要在本开发环境执行
-#       `hermes update` / `hermes gateway ...`。
-#     · 没有正式安装（全新机器）：无需任何前置，直接跑即可。工具 store 默认
-#       落在 <out>/tools，CPython / Node / 依赖全部下载到 <out> 内，
-#       $HOME 下只会有 uv 自己管理的解释器缓存（uv 的行为，可复用）。
-#   硬性防呆（两种情况下都生效）：
-#     · 拒绝把 --out / --home 指到 ~/.hermes 内，或把启动器写进 ~/.local/bin
-#     · 全部可变状态（config / state.db / sessions / skills / cron / logs /
-#       cache / installs）都落在 $OUT/hermes-home，依赖代 key 由 checkout 路径
-#       决定（sha256 前 16 位），与任何已有安装天然不同
-#     · 启动器只发布到 $OUT/bin；launchd 服务名带哈希后缀，不占用裸名
-#       ai.hermes.gateway
-#     · 若检测到正式安装，构建前后对其取指纹（.env / config.yaml /
-#       install-stamp / 工具 store / 启动器）并比对，任何改动都会明确列出
-#   唯一的共享项是工具 store（version+platform 寻址、只增不删）。若 pm/lock.json
-#   与生产一致，则零写入；要绝对隔离用 --isolated-store。
+# Isolation from a production install (~/.hermes):
+#   The script is valid whether or not a production install already exists.
+#     · Production present: hard guards plus a post-build check. Nothing is
+#       written into ~/.hermes, and its Python / tool store is not reused.
+#       Do not run `hermes update` / `hermes gateway ...` from this dev env.
+#     · No production install: just run it. The tool store is <out>/tools.
+#       CPython, Node, and dependencies all download under <out>.
+#   Guards (always on):
+#     · Refuse --out / --home inside ~/.hermes, and refuse launchers in
+#       ~/.local/bin.
+#     · Mutable state (config / state.db / sessions / skills / cron / logs /
+#       cache / installs) lives in $OUT/hermes-home. The install-generation
+#       key is the first 16 hex chars of the checkout path, so it differs
+#       from any existing install.
+#     · Launchers go only to $OUT/bin. The launchd label gets a hash suffix
+#       and does not take the bare name ai.hermes.gateway.
+#     · If a production install is detected, the script fingerprints it
+#       before and after (.env / config.yaml / install-stamp / tool store /
+#       launcher) and lists every change.
+#   The tool store and the install generation both live under .build/ and
+#   share no directory with ~/.hermes.
 #
-# 网络与镜像加速（国内环境）：
-#   症状：`uv sync` 卡在 `Failed to download pydantic==…`、`files.pythonhosted.org`
-#   连接超时。
-#   原因：PM 在无插件成员时走 `uv sync --frozen`，而 uv 的 --frozen 严格按
-#   uv.lock 里记录的「绝对 URL」下载。因此只设索引（UV_INDEX_URL / PIP_INDEX_URL /
-#   pip.conf 的 index-url，PM 都会转发给 uv）只能加速「解析」与 sdist 构建，
-#   不能改变 wheel 的下载主机。实测：三种索引配置下下载主机都仍是
-#   files.pythonhosted.org。
-#   做法：--mirror 把 uv.lock 中
+# Network and mirrors:
+#   Symptom: `uv sync` stalls on `Failed to download pydantic==…` because
+#   files.pythonhosted.org times out.
+#   Cause: with no plugin members, PM runs `uv sync --frozen`, and uv's
+#   --frozen downloads the absolute URLs recorded in uv.lock. Setting an
+#   index (UV_INDEX_URL / PIP_INDEX_URL / pip.conf index-url; PM forwards
+#   all of them to uv) only speeds resolution and sdist builds. It does not
+#   change the wheel host. Measured: all three index setups still download
+#   from files.pythonhosted.org.
+#   What --mirror does: rewrite
 #       https://files.pythonhosted.org/packages/…
-#   改写为
+#   to
 #       <mirror>/packages/…
-#   （各镜像的 /packages/ 路径与 PyPI 完全一致，字节相同、sha256 一致，因此
-#   既不改变锁定内容，也不影响 uv 的哈希校验）。
-#   安全：改写前把 uv.lock 原文件备份到 <out>/.lock-pristine/，结束（或中断、
-#   或异常）时立即还原并校验 sha256；若进程被强杀，下次运行会自动检测并还原。
-#   --mirror auto（默认）的判据是「吞吐」而非「耗时」：拿 uv.lock 里 ≥512KB 的
-#   制品做 Range 采样量吞吐，直连 ≥2 MB/s 就完全不动 uv.lock；否则实测各国内镜像，
-#   最优者须 ≥1 MB/s 且 ≥1.5×直连，并通过 sha256 一致性校验后才改写。
-#   （早期版本拿「最小制品」的下载耗时 ≤1.5s 当健康，而那个样本实测只有 2KB ——
-#   量到的其实是握手延迟。本机直连 PythonHosted 实测 0.10 MB/s，uvloop 1.3MiB
-#   要 27.7 秒，华为镜像 3.96 MB/s 只要 0.11 秒，却因为 2KB 样本 0.3s 就下完而
-#   被判成「直连健康」，整套镜像加速被静默跳过。阈值可用 DIRECT_MIN_MBPS /
-#   MIRROR_MIN_MBPS / MIRROR_MIN_RATIO 覆盖。）
+#   Mirror /packages/ paths match PyPI, so the bytes and sha256 stay the
+#   same. The lock contents and uv's hash check are unchanged.
+#   Safety: the original uv.lock is copied to <out>/.lock-pristine/ before
+#   the rewrite and restored (sha256 checked) on exit, interrupt, or error.
+#   A hard kill is repaired on the next run.
+#   --mirror auto (the default) judges throughput, not elapsed time. It
+#   range-samples a uv.lock artifact of at least 512KB. Direct >= 2 MB/s
+#   leaves uv.lock untouched. Otherwise it measures domestic mirrors; the
+#   winner must be >= 1 MB/s and >= 1.5x direct, and must pass a sha256
+#   check, before the lock is rewritten.
+#   (An earlier version treated "smallest artifact downloads in <= 1.5s" as
+#   healthy. That sample was 2KB, so it measured handshake latency. Direct
+#   PythonHosted was 0.10 MB/s here: uvloop 1.3MiB took 27.7s, while the
+#   Huawei mirror at 3.96 MB/s took 0.11s, but the 2KB sample finished in
+#   0.3s and the mirror was skipped. Override with DIRECT_MIN_MBPS /
+#   MIRROR_MIN_MBPS / MIRROR_MIN_RATIO.)
 #
-#   但依赖只占国内首装的一小半：PM 还要按 pm/lock.json 下载工具链，这批制品
-#   不在 PyPI 上，--mirror 改写管不到。实测（2026-10，本机）：
-#     npmmirror（腾讯，国内 CDN）   3.65 MB/s   ← npm / node 走这里
-#     pypi.tuna.tsinghua.edu.cn     镜像探测 0.26s，PyPI wheel 走这里
-#     nodejs.org                    0.35 MB/s
-#     ffmpeg.martin-riedl.de        0.18 MB/s
-#     github.com（工具链主力）       0.09~0.18 MB/s
-#     cdn.playwright.dev            0.09 MB/s
-#   十个 GitHub 代理（ghfast/gh-proxy/ghproxy.net/gh.llkk.cc/gitmirror/…）实测
-#   全在 0.09~0.17 MB/s，nousresearch 官方兜底 CDN 0.35 MB/s，都没能真正加速；
-#   NJU 镜像覆盖 python-build-standalone，但不覆盖 llama.cpp / bitwarden 等。
+#   Python deps are only part of a first install. PM also downloads the
+#   toolchain from pm/lock.json. Those artifacts are not on PyPI, so
+#   --mirror does not cover them. Measured on this machine, 2026-10:
+#     npmmirror (Tencent CDN)        3.65 MB/s   <- npm / node
+#     pypi.tuna.tsinghua.edu.cn       probe 0.26s; PyPI wheels go here
+#     nodejs.org                      0.35 MB/s
+#     ffmpeg.martin-riedl.de          0.18 MB/s
+#     github.com (most tools)         0.09-0.18 MB/s
+#     cdn.playwright.dev              0.09 MB/s
+#   Ten GitHub proxies (ghfast/gh-proxy/ghproxy.net/gh.llkk.cc/gitmirror/…)
+#   all landed at 0.09-0.17 MB/s. The nousresearch fallback CDN was
+#   0.35 MB/s. None of them really helped. The NJU mirror covers
+#   python-build-standalone, not llama.cpp / bitwarden / etc.
 #
-#   所以真正的杠杆是「少下」而不是「快点下」：全新机器的工具闭包其实很小——
-#     必需：ffmpeg、node、npm、python、ripgrep
-#     可选：agent-browser（依赖 chromium）、cua-driver
-#   其中 Chromium 约 150MB 且只能从 cdn.playwright.dev（0.09 MB/s）拉，单它一项
-#   就要 ~28 分钟。不需要浏览器自动化时用 --minimal 裁掉它，首装可从半小时级
-#   降到十分钟级（--without NAME / --with-browser 可精细控制与回退）。
-#   另外两条「已验证字节一致」的加速会被默认启用：
-#     · PyPI 依赖：改写 uv.lock（--mirror）
-#     · node 制品：改写 pm/lock.json（--tool-mirror）
-#       nodejs.org 0.04 MB/s → npmmirror 10.4 MB/s，30MB 从 10.7 分钟降到 3 秒
-#     · uv 托管的 CPython：--python-mirror 默认指向南京大学（25.3MiB / 1.92s）
-#   pm/lock.json 里其它可映射的源（ffmpeg / chromium / cua-driver / ripgrep /
-#   llama.cpp / bws / uv 自身）国内都没有可用镜像，只能靠代理。
-#   本脚本不猜：开下载前会先跑「工具链预检」，列出缺哪些制品、各自来源、
-#   实测吞吐与预计耗时；主机不可达或过慢时明确提示改用 HTTPS_PROXY。
-#   注意预检只报「连不上/太慢」，真正的失败仍由 PM 的 sha256 校验兜底。
+#   The useful lever is downloading less. A fresh machine's tool closure
+#   is small:
+#     required: ffmpeg, node, npm, python, ripgrep
+#     optional: agent-browser (pulls chromium), cua-driver
+#   Chromium is about 150MB and only comes from cdn.playwright.dev
+#   (0.09 MB/s), so that one artifact is ~28 minutes. Pass --minimal when
+#   you do not need browser automation. --without NAME / --with-browser
+#   adjust that choice later.
+#   Two byte-identical shortcuts are on by default:
+#     · PyPI deps: rewrite uv.lock (--mirror)
+#     · node artifacts: rewrite pm/lock.json (--tool-mirror)
+#       nodejs.org 0.04 MB/s -> npmmirror 10.4 MB/s; 30MB drops from
+#       10.7 minutes to 3 seconds
+#     · uv-managed CPython: --python-mirror defaults to NJU (25.3MiB / 1.92s)
+#   Other mappable hosts in pm/lock.json (ffmpeg / chromium / cua-driver /
+#   ripgrep / llama.cpp / bws / uv itself) have no usable domestic mirror
+#   and need a proxy.
+#   The script does not guess. Before downloading it runs a toolchain
+#   preflight: missing artifacts, hosts, measured throughput, and an
+#   estimate. Unreachable or slow hosts get an HTTPS_PROXY hint.
+#   Preflight only reports "unreachable / slow". Real failures are still
+#   caught by PM's sha256 check.
 #
-# 前端 / JS 层的二进制 postinstall（npm registry 管不到）：
-#   npm ci 的包体已经走 registry 镜像，但有些包的 postinstall 会**绕开 registry**
-#   直接去 GitHub Releases 拉预编译二进制——registry 配置对它们完全无效。实测：
-#     electron@40.10.2 → github.com/electron/electron/releases/…darwin-arm64.zip
-#       109 MiB，本机 connect ETIMEDOUT（20.205.243.166:443），npm ci 直接失败
-#     node-gyp（node-pty 回退到本地编译时用）→ nodejs.org 头文件，0.04 MB/s
-#   处置：
-#     · 桌面端编译本来就是 opt-in，默认构建用不到 Electron 的运行时二进制，所以
-#       默认设 ELECTRON_SKIP_BINARY_DOWNLOAD=1 直接跳过下载（electron 的
-#       install.js 第 14 行会在任何网络动作之前 exit 0），npm ci 不再卡住；
-#     · --with-desktop 时才真正下载，并改走 npmmirror（1.76 MB/s，109 MiB 约
-#       1 分钟；校验用的是包内自带的 checksums.json，不依赖镜像的 SHASUMS256.txt）。
-#       要走 GitHub 官方源加 --electron-mirror none。
-#     · node-gyp 的头文件走 NODEJS_ORG_MIRROR=npmmirror（9.8 MiB）。
+# Frontend binary postinstalls (the npm registry does not cover these):
+#   npm ci package bodies already use the registry mirror, but some
+#   postinstall scripts fetch prebuilt binaries straight from GitHub
+#   Releases. Registry settings do not apply to them. Measured:
+#     electron@40.10.2 -> github.com/electron/electron/releases/…darwin-arm64.zip
+#       109 MiB, connect ETIMEDOUT (20.205.243.166:443); npm ci fails
+#     node-gyp (when node-pty falls back to a local compile) -> nodejs.org
+#       headers, 0.04 MB/s
+#   Handling:
+#     · Desktop is opt-in. The default build does not need the Electron
+#       runtime, so ELECTRON_SKIP_BINARY_DOWNLOAD=1 skips the download
+#       (electron's install.js exits 0 at line 14, before any network)
+#       and npm ci no longer stalls.
+#     · --with-desktop downloads it from npmmirror (1.76 MB/s, ~1 minute
+#       for 109 MiB). Verification uses the package's own checksums.json,
+#       not the mirror's SHASUMS256.txt. Pass --electron-mirror none for
+#       GitHub.
+#     · node-gyp headers use NODEJS_ORG_MIRROR=npmmirror (9.8 MiB).
 #
-# 用法：
-#   ./build-local.sh [选项]
+# Usage:
+#   ./build-local.sh [options]
 #
-# 常用：
-#   ./build-local.sh                  # 完整构建（运行时 + TUI + Dashboard）
-#   ./build-local.sh --with-desktop   # 额外编译桌面端（最慢）
-#   ./build-local.sh --skip-runtime   # 只重编前端
-#   ./build-local.sh --minimal        # 全新机器首装：跳过 Chromium，快很多
-#   ./build-local.sh --clean          # 先清空 .build 再全量重建
-#   source .build/activate.sh         # 激活该开发环境
+# Common:
+#   ./build-local.sh                  # full build (runtime + TUI + dashboard)
+#   ./build-local.sh --with-desktop   # also build the desktop app (slowest)
+#   ./build-local.sh --skip-runtime   # rebuild the frontend only
+#   ./build-local.sh --minimal        # first install: skip Chromium
+#   ./build-local.sh --clean          # wipe .build, then rebuild
+#   source .build/activate.sh         # enter the dev environment
 # =============================================================================
 
 set -euo pipefail
@@ -143,7 +168,7 @@ UVLOCK="$REPO/uv.lock"
 MIRROR_FILE="$REPO/pm/artifact-mirror.json"
 
 # -----------------------------------------------------------------------------
-# 选项
+# Options
 # -----------------------------------------------------------------------------
 OUT=""
 HERMES_HOME_OPT=""
@@ -160,64 +185,64 @@ MIRROR_MODE="auto"
 MIRROR_BASE_OPT=""
 MIRROR_INDEX=false
 NPM_REGISTRY_OPT=""
-ELECTRON_MIRROR_OPT=""   # --electron-mirror URL|none，仅 --with-desktop 时才会用到
+ELECTRON_MIRROR_OPT=""   # --electron-mirror URL|none; used only with --with-desktop
 PYTHON_MIRROR_OPT=""
-WITHOUT_OPT=""      # 空格分隔的工具名，逐个转成 pm 的 --without
+WITHOUT_OPT=""      # space-separated tool names, each passed as pm --without
 MINIMAL=false
 WITH_BROWSER=false
 TOOL_PREFLIGHT=true
-TOOL_MIRROR="auto"   # 工具链制品的国内镜像改写：auto | none
-DECLINED_NOW=""     # 本次实际被裁掉的可选工具（来自 PM 的裁剪记录）
+TOOL_MIRROR="auto"   # toolchain URL rewrite: auto | none
+DECLINED_NOW=""     # optional tools actually skipped this run (from the PM opt-out file)
 
 usage() {
     sed -n '2,/^set -euo pipefail$/p' "$REPO/build-local.sh" | sed -e '$d' -e 's/^# \{0,1\}//'
     cat <<'EOF'
 
-选项：
-  --out DIR           输出根目录（默认 <repo>/.build）
-  --home DIR          开发用 HERMES_HOME（默认 <out>/hermes-home）
-  --store DIR         PM 工具 store
-  --isolated-store    强制使用 <out>/tools，不与 ~/.hermes/tools 共用
-  --with-test-env     额外构建隔离测试环境（dev/test 依赖组，较慢）
-  --skip-runtime      跳过 Python 运行时引导（仅重编前端）
-  --skip-js           跳过 npm 依赖与前端编译（仅引导运行时）
-  --with-desktop      额外编译桌面端（Electron，最慢）
-  --copy-env          从 ~/.hermes/.env 复制密钥到开发 HERMES_HOME
-  --verify            构建后运行 pm doctor 做字节校验
-  --clean             先清空输出目录（仅限本脚本创建/带标记的目录）
-  --mirror MODE       PyPI 镜像：auto（默认）| aliyun | tencent | tuna | huawei | ustc | none
-                      auto = 用 uv.lock 里 ≥512KB 的制品实测「吞吐」：直连 ≥2 MB/s 就
-                      完全不动 uv.lock；否则选最快的国内镜像，经 sha256 校验后改写
-                      阈值可用环境变量覆盖：DIRECT_MIN_MBPS / MIRROR_MIN_MBPS / MIRROR_MIN_RATIO
-  --mirror-base URL   直接指定镜像基址（如 https://mirrors.aliyun.com/pypi）
-  --mirror-index      同时把依赖「解析」索引也指向镜像（默认只改下载地址）
-  --npm-registry URL  npm 镜像（默认 https://registry.npmmirror.com）
+Options:
+  --out DIR           output root (default <repo>/.build)
+  --home DIR          dev HERMES_HOME (default <out>/hermes-home)
+  --store DIR         PM tool store (default <out>/tools; must not be under ~/.hermes)
+  --isolated-store    kept for old command lines. The tool store is already <out>/tools; this flag does nothing extra
+  --with-test-env     also build the isolated test environment (dev/test groups; slower)
+  --skip-runtime      skip the Python runtime bootstrap (rebuild the frontend only)
+  --skip-js           skip npm and frontend builds (bootstrap the runtime only)
+  --with-desktop      also build the desktop app (Electron; slowest)
+  --copy-env          copy secrets from ~/.hermes/.env into the dev HERMES_HOME
+  --verify            run pm doctor after the build
+  --clean             wipe the output directory first (only a directory this script created)
+  --mirror MODE       PyPI mirror: auto (default) | aliyun | tencent | tuna | huawei | ustc | none
+                      auto = measure throughput with a >=512KB uv.lock artifact. Direct >= 2 MB/s
+                      leaves uv.lock alone; otherwise rewrite it to the fastest mirror after a sha256 check
+                      thresholds: DIRECT_MIN_MBPS / MIRROR_MIN_MBPS / MIRROR_MIN_RATIO
+  --mirror-base URL   mirror base URL (for example https://mirrors.aliyun.com/pypi)
+  --mirror-index      also point dependency resolution at the mirror (default: download URLs only)
+  --npm-registry URL  npm registry (default https://registry.npmmirror.com)
   --electron-mirror URL|none
-                      Electron 运行时二进制的镜像（默认 npmmirror），仅 --with-desktop
-                      需要；none = 走 GitHub 官方源。默认构建不下载该二进制（见下）
-  --python-mirror URL  CPython 下载镜像（uv 的 UV_PYTHON_INSTALL_MIRROR）
-                      默认走南京大学镜像（uv 自己的客户端，实测 25.3MiB/1.92s）；
-                      传 --tool-mirror none 可关闭
-  --tool-mirror MODE  工具链制品镜像改写：auto（默认）| none
-                      auto 目前只收录一条经真实安装验证过的映射：
-                        nodejs.org/dist  → npmmirror（实测 0.04 → 10.4 MB/s）
-                      其它源国内无可用镜像，保持原始地址
-  --without NAME      不装某个「可选默认工具」，可重复（可选项：agent-browser、cua-driver）
-  --minimal           等价于 --without agent-browser --without cua-driver
-                      省掉 Chromium（约 150MB，走 cdn.playwright.dev）——国内首装可省半小时
-  --with-browser      反向清除上面的选择，把可选工具装回来
-  --no-tool-preflight 关闭「工具链下载源预检」
-  -h, --help          显示本帮助
+                      Electron runtime mirror (default npmmirror). Used only with --with-desktop.
+                      none = GitHub. The default build does not download that binary.
+  --python-mirror URL  CPython download mirror (uv UV_PYTHON_INSTALL_MIRROR)
+                      default is the NJU mirror (uv's own client).
+                      Pass --tool-mirror none to disable it.
+  --tool-mirror MODE  toolchain URL rewrite: auto (default) | none
+                      auto currently rewrites one mapping that a real install verified:
+                        nodejs.org/dist  -> npmmirror (measured 0.04 -> 10.4 MB/s)
+                      other hosts stay on their original URLs
+  --without NAME      skip an optional default tool; repeatable (agent-browser, cua-driver)
+  --minimal           same as --without agent-browser --without cua-driver
+                      skips Chromium (~150MB from cdn.playwright.dev)
+  --with-browser      clear that opt-out and install the optional tools
+  --no-tool-preflight skip the toolchain download preflight
+  -h, --help          show this help
 EOF
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --out)            OUT="${2:?--out 需要参数}"; shift 2 ;;
+        --out)            OUT="${2:?--out requires a value}"; shift 2 ;;
         --out=*)          OUT="${1#*=}"; shift ;;
-        --home)           HERMES_HOME_OPT="${2:?--home 需要参数}"; shift 2 ;;
+        --home)           HERMES_HOME_OPT="${2:?--home requires a value}"; shift 2 ;;
         --home=*)         HERMES_HOME_OPT="${1#*=}"; shift ;;
-        --store)          STORE_OPT="${2:?--store 需要参数}"; shift 2 ;;
+        --store)          STORE_OPT="${2:?--store requires a value}"; shift 2 ;;
         --store=*)        STORE_OPT="${1#*=}"; shift ;;
         --isolated-store) ISOLATED_STORE=true; shift ;;
         --with-test-env)  WITH_TEST_ENV=true; shift ;;
@@ -227,53 +252,53 @@ while [ $# -gt 0 ]; do
         --copy-env)       COPY_ENV=true; shift ;;
         --verify)         DO_VERIFY=true; shift ;;
         --clean)          DO_CLEAN=true; shift ;;
-        --mirror)         MIRROR_MODE="${2:?--mirror 需要参数}"; shift 2 ;;
+        --mirror)         MIRROR_MODE="${2:?--mirror requires a value}"; shift 2 ;;
         --mirror=*)       MIRROR_MODE="${1#*=}"; shift ;;
-        --mirror-base)    MIRROR_BASE_OPT="${2:?--mirror-base 需要参数}"; shift 2 ;;
+        --mirror-base)    MIRROR_BASE_OPT="${2:?--mirror-base requires a value}"; shift 2 ;;
         --mirror-base=*)  MIRROR_BASE_OPT="${1#*=}"; shift ;;
         --mirror-index)   MIRROR_INDEX=true; shift ;;
-        --npm-registry)   NPM_REGISTRY_OPT="${2:?--npm-registry 需要参数}"; shift 2 ;;
+        --npm-registry)   NPM_REGISTRY_OPT="${2:?--npm-registry requires a value}"; shift 2 ;;
         --npm-registry=*) NPM_REGISTRY_OPT="${1#*=}"; shift ;;
-        --electron-mirror)   ELECTRON_MIRROR_OPT="${2:?--electron-mirror 需要参数}"; shift 2 ;;
+        --electron-mirror)   ELECTRON_MIRROR_OPT="${2:?--electron-mirror requires a value}"; shift 2 ;;
         --electron-mirror=*) ELECTRON_MIRROR_OPT="${1#*=}"; shift ;;
-        --python-mirror)  PYTHON_MIRROR_OPT="${2:?--python-mirror 需要参数}"; shift 2 ;;
+        --python-mirror)  PYTHON_MIRROR_OPT="${2:?--python-mirror requires a value}"; shift 2 ;;
         --python-mirror=*) PYTHON_MIRROR_OPT="${1#*=}"; shift ;;
-        --without)        WITHOUT_OPT="${WITHOUT_OPT} ${2:?--without 需要参数}"; shift 2 ;;
+        --without)        WITHOUT_OPT="${WITHOUT_OPT} ${2:?--without requires a value}"; shift 2 ;;
         --without=*)      WITHOUT_OPT="${WITHOUT_OPT} ${1#*=}"; shift ;;
         --minimal)        MINIMAL=true; shift ;;
         --with-browser)   WITH_BROWSER=true; shift ;;
         --no-tool-preflight) TOOL_PREFLIGHT=false; shift ;;
-        --tool-mirror)    TOOL_MIRROR="${2:?--tool-mirror 需要参数}"; shift 2 ;;
+        --tool-mirror)    TOOL_MIRROR="${2:?--tool-mirror requires a value}"; shift 2 ;;
         --tool-mirror=*)  TOOL_MIRROR="${1#*=}"; shift ;;
         -h|--help)        usage; exit 0 ;;
-        *)                printf '未知选项：%s（用 --help 查看用法）\n' "$1" >&2; exit 2 ;;
+        *)                printf 'unknown option: %s (see --help)\n' "$1" >&2; exit 2 ;;
     esac
 done
 
 if [ "$MINIMAL" = true ] && [ "$WITH_BROWSER" = true ]; then
-    printf '✗ --minimal 与 --with-browser 互斥：前者裁掉可选工具，后者把它们装回来\n' >&2
+    printf '✗ --minimal and --with-browser conflict\n' >&2
     exit 2
 fi
 case "$TOOL_MIRROR" in
     auto|none) ;;
-    *) printf '✗ 未知 --tool-mirror 值：%s（可选 auto | none）\n' "$TOOL_MIRROR" >&2; exit 2 ;;
+    *) printf '✗ unknown --tool-mirror value: %s (auto | none)\n' "$TOOL_MIRROR" >&2; exit 2 ;;
 esac
-# 工具链镜像里同时覆盖 uv 托管的 CPython（python-build-standalone 在 NJU 有镜像）。
-# 单独传 --python-mirror 时以用户值为准。
+# The toolchain mirror also covers uv-managed CPython (NJU mirrors
+# python-build-standalone). An explicit --python-mirror wins.
 if [ "$TOOL_MIRROR" != none ] && [ -z "$PYTHON_MIRROR_OPT" ]; then
     PYTHON_MIRROR_OPT="https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone"
 fi
 if [ "$MINIMAL" = true ]; then
     WITHOUT_OPT="${WITHOUT_OPT} agent-browser cua-driver"
 fi
-# 去掉重复与首尾空白，保持稳定顺序
+# drop duplicates and surrounding whitespace; keep a stable order
 if [ -n "$WITHOUT_OPT" ]; then
     WITHOUT_OPT="$(printf '%s\n' $WITHOUT_OPT | awk 'NF && !seen[$0]++' | tr '\n' ' ')"
     for _w in $WITHOUT_OPT; do
         case "$_w" in
             agent-browser|cua-driver) ;;
-            *) printf '✗ 不可裁剪的工具：%s（可选项只有 agent-browser、cua-driver；\n' "$_w" >&2
-               printf '  必需集是 ffmpeg/node/npm/python/ripgrep，始终安装）\n' >&2
+            *) printf '✗ cannot omit %s (only agent-browser and cua-driver are optional;\n' "$_w" >&2
+               printf '  ffmpeg/node/npm/python/ripgrep are always installed)\n' >&2
                exit 2 ;;
         esac
     done
@@ -281,11 +306,11 @@ fi
 
 case "$MIRROR_MODE" in
     auto|aliyun|tencent|tuna|huawei|ustc|none) ;;
-    *) printf '未知 --mirror 值：%s（可选 auto|aliyun|tencent|tuna|huawei|ustc|none）\n' "$MIRROR_MODE" >&2; exit 2 ;;
+    *) printf 'unknown --mirror value: %s (auto|aliyun|tencent|tuna|huawei|ustc|none)\n' "$MIRROR_MODE" >&2; exit 2 ;;
 esac
 
 # -----------------------------------------------------------------------------
-# 日志
+# Logging
 # -----------------------------------------------------------------------------
 if [ -t 1 ]; then
     C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_CYAN='\033[0;36m'
@@ -301,14 +326,14 @@ step() { printf "\n${C_CYAN}▸ %s${C_NC}\n" "$*"; }
 dim()  { printf "${C_DIM}%s${C_NC}\n" "$*"; }
 
 # -----------------------------------------------------------------------------
-# 生产安装隔离护栏
+# Production-install isolation
 # -----------------------------------------------------------------------------
-# 本机可能已存在正式安装（~/.hermes + ~/.local/bin/hermes）。以下是硬性防呆：
-# 任何会让开发构建写进生产目录的组合一律拒绝执行，而不是警告后继续。
+# A production install may already exist (~/.hermes + ~/.local/bin/hermes).
+# Any combination that would write the dev build into that tree is refused.
 PROD_HOME="$HOME/.hermes"
 PROD_BIN="$HOME/.local/bin"
 
-hash_of() { # 文件 sha256；不存在输出 "-"
+hash_of() { # file sha256, or "-" when missing
     if [ -f "$1" ]; then
         if command -v shasum >/dev/null 2>&1; then
             shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
@@ -320,7 +345,7 @@ hash_of() { # 文件 sha256；不存在输出 "-"
     fi
 }
 
-dir_listing_hash() { # 目录直属条目名（排序）的 sha256，用来发现「多出/少了条目」
+dir_listing_hash() { # sha256 of sorted immediate entry names, to spot added/removed entries
     local tmp out
     tmp="$(mktemp)"
     if [ -d "$1" ]; then
@@ -331,7 +356,7 @@ dir_listing_hash() { # 目录直属条目名（排序）的 sha256，用来发�
     printf '%s' "$out"
 }
 
-production_fingerprint() { # 生产安装中「不可再生」的小文件 + 目录结构的指纹
+production_fingerprint() { # fingerprint of irreplaceable production files plus directory shape
     printf 'env              %s\n' "$(hash_of "$PROD_HOME/.env")"
     printf 'config.yaml      %s\n' "$(hash_of "$PROD_HOME/config.yaml")"
     printf 'install-stamp    %s\n' "$(hash_of "$PROD_HOME/hermes-agent/install-stamp.json")"
@@ -347,101 +372,105 @@ production_fingerprint() { # 生产安装中「不可再生」的小文件 + 目
     done
 }
 
-assert_isolation() { # 在解析出全部目标路径后调用；不满足即退出
+assert_isolation() { # call after every target path is known; exit on failure
     local problem=""
 
     case "$HERMES_HOME_DIR/" in
         "$PROD_HOME"/*)
-            problem="开发 HERMES_HOME 落在生产目录内：${HERMES_HOME_DIR}" ;;
+            problem="dev HERMES_HOME is inside the production home: ${HERMES_HOME_DIR}" ;;
     esac
     if [ -z "$problem" ]; then
         case "$OUT/" in
             "$PROD_HOME"/*)
-                problem="产物根目录落在生产目录内：${OUT}" ;;
+                problem="output root is inside the production home: ${OUT}" ;;
         esac
     fi
     if [ -z "$problem" ]; then
         case "$BIN_DIR" in
             "$PROD_BIN"|"$PROD_BIN"/*)
-                problem="启动器目录就是生产启动器目录：${BIN_DIR}" ;;
+                problem="launcher directory is the production launcher directory: ${BIN_DIR}" ;;
         esac
     fi
     if [ -n "$problem" ]; then
-        printf "${C_RED}✗ 隔离检查未通过：%s${C_NC}\n" "$problem" >&2
-        printf '  本脚本拒绝运行，以免破坏 %s 下的正式安装。\n' "$PROD_HOME" >&2
-        printf '  改用默认输出目录（<repo>/.build）或另指定 --out / --home。\n' >&2
+        printf "${C_RED}✗ isolation check failed: %s${C_NC}\n" "$problem" >&2
+        printf '  refusing to run, so the install under %s is left alone.\n' "$PROD_HOME" >&2
+        printf '  use the default output (<repo>/.build) or pass --out / --home.\n' >&2
         exit 1
     fi
 
-    # 开发 install key 必须与生产不同，否则会共用依赖代目录。
+    # The dev install key must differ from production, or they share one generation dir.
     DEV_INSTALL_KEY="$(printf '%s' "$REPO" | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)"
     PROD_INSTALL_KEY="$(printf '%s' "$PROD_HOME/hermes-agent" | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-16)"
     if [ "$DEV_INSTALL_KEY" = "$PROD_INSTALL_KEY" ]; then
-        die "开发 install key 与生产相同（${DEV_INSTALL_KEY}）——两者会争用同一依赖代目录"
+        die "dev install key matches production (${DEV_INSTALL_KEY}); they would share one install generation"
     fi
 
-    # launchd 服务名后缀：生产占据裸名 ai.hermes.gateway，开发必须是哈希后缀。
+    # launchd label: production owns the bare ai.hermes.gateway name; dev uses a hash suffix.
     if [ "$HERMES_HOME_DIR" = "$PROD_HOME" ]; then
-        die "开发 HERMES_HOME 不允许等于生产家目录"
+        die "dev HERMES_HOME must not equal the production home"
     fi
 
     SHARED_STORE=false
     case "$STORE/" in
-        "$PROD_HOME"/*) SHARED_STORE=true ;;
+        "$PROD_HOME"|"$PROD_HOME"/*)
+            printf "${C_RED}✗ isolation check failed: tool store is inside the production home: %s${C_NC}\n" "$STORE" >&2
+            printf '  CPython and the toolchain stay in <out>/tools, not in %s.\n' "$PROD_HOME" >&2
+            exit 1 ;;
     esac
 }
 
 # -----------------------------------------------------------------------------
-# 前置检查
+# Prerequisites
 # -----------------------------------------------------------------------------
 for tool in git curl tar unzip; do
-    command -v "$tool" >/dev/null 2>&1 || die "缺少前置命令：$tool"
+    command -v "$tool" >/dev/null 2>&1 || die "missing required command: $tool"
 done
-[ -f "$LOCK" ] || die "找不到 pm/lock.json，请在 Hermes 仓库根目录运行本脚本"
+[ -f "$LOCK" ] || die "pm/lock.json not found; run this script from the Hermes repo root"
 
 case "$(uname -s)" in
     Linux)  OS=linux ;;
     Darwin) OS=darwin ;;
-    *)      die "不支持的操作系统：$(uname -s)" ;;
+    *)      die "unsupported OS: $(uname -s)" ;;
 esac
 case "$(uname -m)" in
     arm64|aarch64) ARCH=arm64 ;;
     x86_64|amd64)  ARCH=x64 ;;
-    *)             die "不支持的架构：$(uname -m)" ;;
+    *)             die "unsupported architecture: $(uname -m)" ;;
 esac
 TARGET="$OS-$ARCH"
 
 if [ "$OS" = darwin ]; then
     if ! command -v xcode-select >/dev/null 2>&1 \
        || [ ! -d "$(xcode-select -p 2>/dev/null || echo /nonexistent)" ]; then
-        warn "未检测到 Xcode Command Line Tools，原生依赖可能编译失败"
+        warn "Xcode Command Line Tools not found; native dependencies may fail to compile"
     fi
 fi
 
 # -----------------------------------------------------------------------------
-# 输出目录与 --clean 安全护栏
+# Output directory and the --clean guard
 # -----------------------------------------------------------------------------
 OUT="${OUT:-$REPO/.build}"
 case "$OUT" in
-    ""|/|"$HOME"|"$HOME"/|"$REPO"|"$REPO"/) die "拒绝使用「${OUT}」作为输出目录" ;;
+    ""|/|"$HOME"|"$HOME"/|"$REPO"|"$REPO"/) die "refusing to use "${OUT}" as the output directory" ;;
 esac
-# 在创建任何目录之前就先挡住「写进生产目录」的路径（否则下面的 mkdir -p 会先落地）
+# Refuse paths inside the production home before mkdir -p can create them.
 case "$OUT"/ in
-    "$PROD_HOME"/*) die "拒绝把产物写进生产目录：${OUT}" ;;
+    "$PROD_HOME"/*) die "refusing to write artifacts into the production home: ${OUT}" ;;
 esac
 mkdir -p "$(dirname "$OUT")"
 OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"
 MARKER="$OUT/.hermes-build-local.json"
 
 # -----------------------------------------------------------------------------
-# 镜像改写的崩溃恢复
+# Crash recovery for rewritten lockfiles
 # -----------------------------------------------------------------------------
-# 镜像加速靠「临时改写锁定文件里的绝对下载地址」实现，涉及两个文件：
-#   uv.lock      —— PyPI wheel / sdist（--mirror）
-#   pm/lock.json —— 工具链制品（--tool-mirror，如 node / CPython）
-# 若上一次运行被强杀（SIGKILL 无法被 trap 捕获），这里负责在本次运行最前面把
-# 它们还原——先于 --clean，避免备份被一起删掉。判定条件刻意收窄：只有
-# 「有备份」且「当前文件已不含原始主机」才认定是我们留下的改写状态。
+# Mirrors work by temporarily rewriting absolute download URLs in two files:
+#   uv.lock      —— PyPI wheels / sdists (--mirror)
+#   pm/lock.json —— toolchain artifacts (--tool-mirror, for example node)
+# A previous SIGKILL is not caught by the trap, so this runs before --clean
+# and restores those files before the backup directory can be deleted.
+# The test is narrow: a backup exists AND the current file no longer
+# contains the original host.
 PRISTINE_DIR="$OUT/.lock-pristine"
 UVLOCK_BACKUP="$PRISTINE_DIR/uv.lock"
 TOOLLOCK_BACKUP="$PRISTINE_DIR/pm-lock.json"
@@ -450,22 +479,22 @@ TOOLLOCK_REWRITTEN=false
 UVLOCK_SHA_BEFORE="$(hash_of "$UVLOCK")"
 TOOLLOCK_SHA_BEFORE="$(hash_of "$LOCK")"
 
-# 还原一个被改写的锁文件。$1=备份路径 $2=目标路径 $3=标签 $4=原始 sha
-# 注意：这里**不能**删 PRISTINE_DIR —— uv.lock 与 pm/lock.json 的备份共用一个
-# 目录，先还原哪个就把目录删掉会让另一个还原时找不到备份而静默跳过。
-# 目录统一由 restore_lock 在所有还原完成后再清。
+# Restore one rewritten lockfile. $1=backup $2=target $3=label $4=original sha
+# Do not delete PRISTINE_DIR here. uv.lock and pm/lock.json share that
+# directory; deleting it after the first restore would make the second
+# restore skip its backup. restore_lock removes the directory at the end.
 restore_one_lock() {
     local backup="$1" target="$2" label="$3" want="$4"
     [ -f "$backup" ] || return 0
     cp -p "$backup" "$target"
     if [ "$(hash_of "$target")" = "$want" ]; then
-        ok "${label} 已还原（sha256 与改写前一致）"
+        ok "${label} restored (sha256 matches the pre-rewrite file)"
     else
-        warn "${label} 还原后 sha256 与改写前不一致，请人工检查 ${target}"
+        warn "${label} sha256 mismatch after restore; check ${target}"
     fi
 }
 
-# EXIT/INT/TERM/HUP 的统一收尾：还原所有被改写的锁文件
+# EXIT/INT/TERM/HUP: restore every rewritten lockfile
 restore_lock() {
     if [ "$LOCK_REWRITTEN" = true ]; then
         restore_one_lock "$UVLOCK_BACKUP" "$UVLOCK" "uv.lock" \
@@ -480,11 +509,11 @@ restore_lock() {
     rm -rf "$PRISTINE_DIR" 2>/dev/null || true
 }
 
-# 恢复上次运行时遗留的改写（先于 --clean，避免备份被删）
+# Repair a rewrite left by the previous run, before --clean can delete the backup
 if [ -f "$UVLOCK_BACKUP" ] \
    && [ "$(hash_of "$UVLOCK")" != "$(cat "$PRISTINE_DIR/uv.lock.sha256" 2>/dev/null || echo '-')" ] \
    && ! grep -q 'files\.pythonhosted\.org/packages/' "$UVLOCK" 2>/dev/null; then
-    warn "检测到上次运行遗留的镜像改写（uv.lock 未还原），正在自动还原"
+    warn "uv.lock was left rewritten by a previous run; restoring it"
     UVLOCK_SHA_BEFORE="$(cat "$PRISTINE_DIR/uv.lock.sha256")"
     LOCK_REWRITTEN=true
     restore_lock
@@ -492,32 +521,33 @@ fi
 if [ -f "$TOOLLOCK_BACKUP" ] \
    && [ "$(hash_of "$LOCK")" != "$(cat "$PRISTINE_DIR/pm-lock.json.sha256" 2>/dev/null || echo '-')" ] \
    && ! grep -q 'nodejs\.org/dist/' "$LOCK" 2>/dev/null; then
-    warn "检测到上次运行遗留的工具镜像改写（pm/lock.json 未还原），正在自动还原"
+    warn "pm/lock.json was left rewritten by a previous run; restoring it"
     TOOLLOCK_SHA_BEFORE="$(cat "$PRISTINE_DIR/pm-lock.json.sha256")"
     TOOLLOCK_REWRITTEN=true
     restore_lock
 fi
 rm -rf "$PRISTINE_DIR" 2>/dev/null || true
 
-# 兜底提示：备份是跟着 --out 目录走的，一旦那个目录被删/被移走，上面的自恢复
-# 就无从下手，锁定文件会一直停在改写状态（让人误以为「依赖来自镜像」是常态）。
-# 判定条件：uv.lock 里一条 files.pythonhosted.org 都没有——正常仓库必然有几千条。
+# Last-resort warning. The backup lives under --out. If that directory was
+# deleted or moved, the self-repair above has nothing to restore and the
+# lockfile stays rewritten.
+# Trigger: uv.lock contains no files.pythonhosted.org URLs. A normal tree has thousands.
 if [ -f "$UVLOCK" ] && ! grep -q 'files\.pythonhosted\.org/packages/' "$UVLOCK" 2>/dev/null; then
-    warn "uv.lock 中不含 files.pythonhosted.org，疑似仍处于镜像改写状态且未找到备份"
+    warn "uv.lock has no files.pythonhosted.org URLs and no backup was found; it may still be rewritten"
     if [ -d "$REPO/.git" ]; then
-        dim "  还原：git -C $REPO checkout -- uv.lock"
+        dim "  restore: git -C $REPO checkout -- uv.lock"
     else
-        dim "  还原：本 checkout 没有 .git，请从原始副本重新取回 uv.lock"
+        dim "  restore: this checkout has no .git; copy uv.lock back from an original tree"
     fi
 fi
 
 if [ "$DO_CLEAN" = true ] && [ -e "$OUT" ]; then
     if [ ! -d "$OUT" ]; then
-        die "拒绝清理：「${OUT}」不是目录"
+        die "refusing to clean: "${OUT}" is not a directory"
     elif [ -n "$(ls -A "$OUT" 2>/dev/null || true)" ] && [ ! -f "$MARKER" ]; then
-        die "拒绝清理：「${OUT}」非空且缺少归属标记（${MARKER}）。请手工确认后再删。"
+        die "refusing to clean: "${OUT}" is non-empty and has no ownership marker (${MARKER})"
     fi
-    info "清空输出目录 $OUT"
+    info "clearing output directory $OUT"
     rm -rf "$OUT"
 fi
 
@@ -527,30 +557,28 @@ PRODUCTS_DIR="$OUT/products"
 ICONS_DIR="$OUT/icons"
 
 if [ -n "${HERMES_HOME:-}" ] && [ "$HERMES_HOME" != "$HERMES_HOME_DIR" ]; then
-    warn "当前 shell 的 HERMES_HOME=$HERMES_HOME 将被覆盖为 $HERMES_HOME_DIR"
+    warn "HERMES_HOME=$HERMES_HOME in this shell will be replaced with $HERMES_HOME_DIR"
 fi
 
-# 工具 store：默认复用已有的 ~/.hermes/tools（省掉数 GB 下载），否则落在
-# .build/tools。工具条目按「版本 + 平台」寻址，多安装共用是官方设计。
+# The tool store is always inside this output directory. CPython, uv, and
+# node resolve from here. ~/.hermes/tools is never probed or reused.
 if [ -n "$STORE_OPT" ]; then
     STORE="$STORE_OPT"
-elif [ "$ISOLATED_STORE" = true ]; then
-    STORE="$OUT/tools"
-elif [ -f "$HOME/.hermes/tools/facts.json" ]; then
-    STORE="$HOME/.hermes/tools"
 else
     STORE="$OUT/tools"
 fi
 
 assert_isolation
 
-# 生产安装指纹：构建前取一次，结束后比对。只覆盖不可再生的小文件与目录结构，
-# 保证「构建是否动过生产安装」是一个可判定的事实，而不是靠假设。
-# 注意：必须在创建任何目录之前，否则隔离检查失败时已经留下了痕迹。
+# Fingerprint the production install before the build and compare after.
+# Only irreplaceable small files and directory shape are covered, so
+# "did this build touch production?" is a fact, not an assumption.
+# Take it before creating any directory, or a failed isolation check
+# would already have left a trace.
 PROD_BEFORE="$(mktemp)"
 production_fingerprint > "$PROD_BEFORE"
 
-# 共享 store 时额外记录条目名，构建后给出「新增/消失」的具体清单
+# On a shared store, record entry names so the end of the build can list additions and removals.
 STORE_ENTRIES_BEFORE="$(mktemp)"
 if [ "$SHARED_STORE" = true ] && [ -d "$STORE" ]; then
     ( find "$STORE" -maxdepth 1 -mindepth 1 -exec basename {} \; 2>/dev/null \
@@ -563,26 +591,23 @@ printf '%s\n' '{"schema":"hermes-build-local-v1"}' > "$MARKER"
 export HERMES_HOME="$HERMES_HOME_DIR"
 export HERMES_RUNTIME_DIR="$STORE"
 
-printf "\n${C_CYAN}☤ Hermes 本地开发构建${C_NC}\n"
-dim "  仓库         $REPO"
-dim "  输出         $OUT"
+printf "\n${C_CYAN}☤ Hermes local dev build${C_NC}\n"
+dim "  repo         $REPO"
+dim "  output       $OUT"
 dim "  HERMES_HOME  $HERMES_HOME"
-dim "  工具 store   $STORE"
-dim "  目标平台     $TARGET"
+dim "  tool store   $STORE"
+dim "  target       $TARGET"
 if [ -d "$PROD_HOME" ]; then
-    dim "  生产安装     ${PROD_HOME}（已检测到，本脚本不会写入）"
-    if [ "$SHARED_STORE" = true ]; then
-        dim "               ↳ 工具 store 为共享复用；用 --isolated-store 可完全隔离"
-    fi
+    dim "  production   ${PROD_HOME} (present; this run still writes tools only to ${STORE})"
 else
-    dim "  生产安装     未检测到（全新机器；本次会完整下载工具链与依赖）"
-    dim "               ↳ 工具 store 落在 ${STORE}，全部产物都在 ${OUT} 内"
+    dim "  production   not found"
+    dim "               toolchain and artifacts stay under ${OUT}"
 fi
 
 # -----------------------------------------------------------------------------
-# pm/lock.json pin 解析（在 Python 可用之前用 awk 完成）
+# Parse pm/lock.json pins with awk, before a Python interpreter exists.
 # -----------------------------------------------------------------------------
-pin() { # $1 = url|sha256|version, $2 = 包名（默认 uv）
+pin() { # $1 = url|sha256|version, $2 = package name (default uv)
     awk -F '"' -v package="${2:-uv}" -v target="$TARGET" -v field="$1" '
         /^[[:space:]]*("[^"]+"[[:space:]]*:[[:space:]]*)?\{[[:space:]]*$/ { path[++depth] = $2; next }
         /^[[:space:]]*}[[:space:]]*,?[[:space:]]*$/                        { delete path[depth--]; next }
@@ -596,46 +621,199 @@ MIRROR_ORIGIN="$(awk -F '"' '$2 == "origin" { print $4; exit }' "$MIRROR_FILE" 2
 MIRROR_PREFIX="$(awk -F '"' '$2 == "prefix" { print $4; exit }' "$MIRROR_FILE" 2>/dev/null || true)"
 
 # -----------------------------------------------------------------------------
-# 步骤 1：引导 Python 运行时（uv → CPython → PM 依赖同步）
+# Step 1: bootstrap the Python runtime (uv -> CPython -> PM dependency sync)
 # -----------------------------------------------------------------------------
-BOOT_PY=""
-for candidate in "$STORE"/python-*/bin/python3; do
-    [ -x "$candidate" ] && { BOOT_PY="$candidate"; break; }
-done
+# Prefer an interpreter already on disk. PM publishes
+# python-<version>-<target>/bin/python3; uv publishes under uv-python/.
+# A hit skips the CPython download on later runs.
+export UV_PYTHON_INSTALL_DIR="$STORE/uv-python"
+find_boot_py() {
+    local candidate base
+    BOOT_PY=""
+    for candidate in "$STORE"/python-*/bin/python3 \
+                     "$STORE"/uv-python/*/bin/python3 \
+                     "$STORE"/uv-python/*/bin/python3.*; do
+        [ -x "$candidate" ] && [ -f "$candidate" ] || continue
+        base="$(basename "$candidate")"
+        case "$base" in
+            python3|python3.[0-9]|python3.[0-9][0-9])
+                BOOT_PY="$candidate"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+find_boot_py || true
+
+# GitHub releases are unreachable on some networks. The official uv wheel
+# lives on the same path as the PyPI index, so a domestic mirror serves the
+# same binary. Verify with the simple-index sha256, not the GitHub tarball
+# digest recorded in the lockfile.
+uv_wheel_filename() { # $1 = uv version
+    case "$TARGET" in
+        darwin-arm64) printf 'uv-%s-py3-none-macosx_11_0_arm64.whl' "$1" ;;
+        darwin-x64)   printf 'uv-%s-py3-none-macosx_10_12_x86_64.whl' "$1" ;;
+        linux-arm64)  printf 'uv-%s-py3-none-manylinux_2_28_aarch64.whl' "$1" ;;
+        linux-x64)    printf 'uv-%s-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl' "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+stage_uv_from_wheel() { # $1 = version  $2 = install dir; sets UV on success
+    local version="$1" entry="$2" name base page href path sha url tmp got bin seen
+    name="$(uv_wheel_filename "$version")" || return 1
+    seen=" "
+    for base in ${MIRROR_BASE:+"$MIRROR_BASE"} \
+        "https://repo.huaweicloud.com/repository/pypi" \
+        "https://mirrors.aliyun.com/pypi" \
+        "https://mirrors.cloud.tencent.com/pypi" \
+        "https://pypi.tuna.tsinghua.edu.cn" \
+        "https://mirrors.ustc.edu.cn/pypi"
+    do
+        case "$seen" in *" $base "*) continue ;; esac
+        seen="$seen$base "
+        page="$(mktemp)"
+        if ! curl -fsSL --connect-timeout 8 --max-time 30 -o "$page" "${base%/}/simple/uv/"; then
+            rm -f "$page"
+            continue
+        fi
+        href="$(tr '"' '\n' < "$page" | grep -F "$name" | head -1 || true)"
+        rm -f "$page"
+        [ -n "$href" ] || continue
+        sha="${href#*#sha256=}"
+        path="${href%%#*}"
+        case "$sha" in
+            "$href"|""|*[!0-9a-f]*) continue ;;
+        esac
+        case "$path" in
+            https://*) url="$path" ;;
+            *)
+                while [ "${path#../}" != "$path" ]; do path="${path#../}"; done
+                url="${base%/}/${path#/}"
+                ;;
+        esac
+        info "downloading the uv wheel from PyPI mirror ${base}..."
+        tmp="$(mktemp -d "$STORE/.uvwheel-XXXXXX")"
+        if ! curl -fsSL --connect-timeout 8 --max-time 120 -o "$tmp/$name" "$url"; then
+            rm -rf "$tmp"
+            continue
+        fi
+        got="$(hash_of "$tmp/$name")"
+        if [ "$got" != "$sha" ]; then
+            rm -rf "$tmp"
+            warn "uv wheel sha256 mismatch; trying the next mirror"
+            continue
+        fi
+        mkdir -p "$tmp/tree"
+        unzip -q "$tmp/$name" -d "$tmp/tree"
+        bin="$(find "$tmp/tree" -type f -path '*/scripts/uv' | head -1)"
+        if [ -z "$bin" ] || [ ! -f "$bin" ]; then
+            rm -rf "$tmp"
+            continue
+        fi
+        rm -rf "$entry"
+        mkdir -p "$entry"
+        cp "$bin" "$entry/uv"
+        if [ -f "$(dirname "$bin")/uvx" ]; then
+            cp "$(dirname "$bin")/uvx" "$entry/uvx"
+        fi
+        chmod +x "$entry/uv" "$entry/uvx" 2>/dev/null || true
+        rm -rf "$tmp"
+        UV="$entry/uv"
+        return 0
+    done
+    return 1
+}
+
+# Seed NJU's python-build-standalone into PM's fetch cache.
+# Do not rewrite pm/lock.json: PM's urllib treats NJU's self-redirect 302
+# as an infinite loop. curl downloads it, checks the lock sha256, and PM
+# then hits the cache instead of GitHub.
+seed_python_mirror() {
+    local url sha rel file mirror dest tmp got
+    [ -n "$PYTHON_MIRROR_OPT" ] || return 0
+    url="$(pin url python)"
+    sha="$(pin sha256 python)"
+    [ -n "$url" ] && [ -n "$sha" ] || return 0
+    case "$url" in
+        https://github.com/astral-sh/python-build-standalone/releases/download/*)
+            rel="${url#https://github.com/astral-sh/python-build-standalone/releases/download/}"
+            ;;
+        *) return 0 ;;
+    esac
+    file="${rel##*/}"
+    mirror="${PYTHON_MIRROR_OPT%/}/$rel"
+    dest="$STORE/fetch-${sha}/${file}"
+    # The published store entry is enough. Do not re-fetch the tarball.
+    if [ -n "$(find "$STORE" -maxdepth 1 -type d -name 'python-*' -print -quit 2>/dev/null)" ]; then
+        ok "Reusing installed CPython in the tool store"
+        return 0
+    fi
+    if [ -f "$dest" ] && [ "$(hash_of "$dest")" = "$sha" ]; then
+        ok "Reusing cached CPython archive"
+        return 0
+    fi
+    info "downloading the CPython archive from the domestic mirror..."
+    dim "  ${mirror}"
+    tmp="$(mktemp -d "$STORE/.cpython-XXXXXX")"
+    if ! curl -fsSL --connect-timeout 8 --max-time 180 -o "$tmp/$file" "$mirror"; then
+        rm -rf "$tmp"
+        warn "CPython mirror download failed; PM will try the original URL"
+        return 0
+    fi
+    got="$(hash_of "$tmp/$file")"
+    if [ "$got" != "$sha" ]; then
+        rm -rf "$tmp"
+        warn "CPython mirror sha256 mismatch (expected ${sha}, got ${got}); not caching it"
+        return 0
+    fi
+    mkdir -p "$STORE/fetch-${sha}"
+    mv "$tmp/$file" "$dest"
+    rm -rf "$tmp"
+    ok "CPython archive cached from the domestic mirror"
+}
 
 stage_uv() {
     local uv_version uv_entry url sha archive got tmp inner inner_count child mirror
     uv_version="$(pin version)"
-    [ -n "$uv_version" ] || die "pm/lock.json 中缺少 uv 的版本 pin"
+    [ -n "$uv_version" ] || die "pm/lock.json has no uv version pin"
     uv_entry="$STORE/uv-$uv_version-$TARGET"
 
     if [ -x "$uv_entry/uv" ]; then
         UV="$uv_entry/uv"
-        ok "复用已安装的 uv（$("$UV" --version 2>/dev/null || echo "uv $uv_version")）"
+        ok "reusing installed uv ($("$UV" --version 2>/dev/null || echo "uv $uv_version"))"
         return 0
     fi
 
     url="$(pin url)"; sha="$(pin sha256)"
-    [ -n "$url" ] && [ -n "$sha" ] || die "pm/lock.json 中缺少 $TARGET 的 uv 制品"
+    [ -n "$url" ] && [ -n "$sha" ] || die "pm/lock.json has no uv artifact for $TARGET"
 
-    info "下载 pinned uv ${uv_version}（${TARGET}）..."
+    info "downloading pinned uv ${uv_version} (${TARGET})..."
     mkdir -p "$STORE"
     tmp="$(mktemp -d "$STORE/.bootstrap-XXXXXX")"
     archive="$tmp/${url##*/}"
 
-    if ! curl -fsSL -o "$archive" "$url"; then
+    if ! curl -fsSL --connect-timeout 8 --max-time 25 -o "$archive" "$url"; then
+        rm -f "$archive"
+        info "GitHub is unreachable; installing uv from a domestic PyPI mirror..."
+        if stage_uv_from_wheel "$uv_version" "$uv_entry"; then
+            rm -rf "$tmp"
+            ok "uv is ready ($("$UV" --version 2>/dev/null || echo "uv $uv_version"))"
+            return 0
+        fi
         if [ -n "$MIRROR_ORIGIN" ] && [ -n "$MIRROR_PREFIX" ]; then
             mirror="$MIRROR_ORIGIN/$MIRROR_PREFIX$sha"
-            info "主源不可用，回退镜像..."
-            curl -fsSL -o "$archive" "$mirror" \
-                || { rm -rf "$tmp"; die "uv 下载失败（主源与镜像均不可用）"; }
+            info "domestic wheel unavailable; trying the official mirror..."
+            curl -fsSL --connect-timeout 8 --max-time 60 -o "$archive" "$mirror" \
+                || { rm -rf "$tmp"; die "uv download failed (GitHub, domestic PyPI, and the official mirror)"; }
         else
-            rm -rf "$tmp"; die "uv 下载失败：$url"
+            rm -rf "$tmp"; die "uv download failed: $url"
         fi
     fi
 
     got="$( (sha256sum "$archive" 2>/dev/null || shasum -a 256 "$archive") | cut -d' ' -f1 | tr -d '\\')"
-    [ "$got" = "$sha" ] || { rm -rf "$tmp"; die "uv sha256 校验失败：期望 ${sha}，实际 ${got}"; }
+    [ "$got" = "$sha" ] || { rm -rf "$tmp"; die "uv sha256 mismatch: expected ${sha}, got ${got}"; }
 
     mkdir -p "$tmp/tree"
     case "$archive" in
@@ -653,31 +831,48 @@ stage_uv() {
     mv "$tmp/entry" "$uv_entry"
     rm -rf "$tmp"
     UV="$uv_entry/uv"
-    ok "uv 已就绪（$("$UV" --version 2>/dev/null || echo "uv $uv_version")）"
+    ok "uv is ready ($("$UV" --version 2>/dev/null || echo "uv $uv_version"))"
 }
 
 # -----------------------------------------------------------------------------
-# 镜像加速：把 uv.lock 的下载 URL 改写为镜像
+# Mirror acceleration: rewrite uv.lock download URLs
 # -----------------------------------------------------------------------------
-# 为什么只能这么做：PM 在无插件成员时走 `uv sync --frozen`，而 uv 的 --frozen
-# 严格按 uv.lock 里记录的绝对 URL 下载（实测：无论怎么配 UV_INDEX_URL /
-# UV_DEFAULT_INDEX，下载主机都仍是 files.pythonhosted.org）。索引配置只影响
-# 「解析」和 sdist 构建。各镜像的 /packages/ 路径与 PyPI 完全一致、字节相同
-# （探测时用锁内 sha256 校验），所以改写既不改动锁定内容，也不影响 uv 校验。
+# Why rewrite the lock: with no plugin members PM runs `uv sync --frozen`,
+# and uv's --frozen downloads the absolute URLs in uv.lock. Measured: no
+# UV_INDEX_URL / UV_DEFAULT_INDEX setting changes the host away from
+# files.pythonhosted.org. Index settings only affect resolution and sdist
+# builds. Mirror /packages/ paths match PyPI byte for byte (the probe
+# checks the lock sha256), so the rewrite does not change the lock
+# contents or uv's hash check.
 MIRROR_BASE=""
-MIRROR_LABEL="直连"
+MIRROR_LABEL="direct"
 MIRROR_DETAIL=""
+MIRROR_CHOICE="$OUT/cache/pypi-mirror"
+# Remember the last mirror decision so a later run does not re-download
+# probe samples. Delete this file (or pass a different --mirror) to measure again.
+save_mirror_choice() {
+    mkdir -p "$OUT/cache"
+    printf '%s\t%s\n' "${MIRROR_LABEL:-direct}" "${MIRROR_BASE:-}" > "$MIRROR_CHOICE"
+}
+load_mirror_choice() {
+    [ -f "$MIRROR_CHOICE" ] || return 1
+    IFS="$(printf '\t')" read -r MIRROR_LABEL MIRROR_BASE < "$MIRROR_CHOICE" || return 1
+    [ -n "${MIRROR_LABEL:-}" ] || return 1
+    return 0
+}
 NPM_REGISTRY="${NPM_REGISTRY_OPT:-https://registry.npmmirror.com}"
-MIRROR_PROBE_PATH=""    # 测速样本路径（≥512KB 中最小的一个，用于量吞吐）
-MIRROR_PROBE_HASH=""    # 校验样本的 sha256（最小文件，用于证明镜像字节一致）
-MIRROR_VERIFY_PATH=""   # 校验样本路径
-# auto 模式的判据是「吞吐」而不是「耗时」：早期版本用最小文件（实测只有 2KB 的
-# types-certifi）下载耗时 ≤1.5s 就判定直连健康，而 2KB 在 0.6s 内下完量的其实是
-# 延迟、不是带宽——结果判出「直连健康」而跳过镜像，真实依赖（如 uvloop 1.3MiB）
-# 仍以 49 KB/s 直连，单文件就要 27.7 秒。现在改为：
-#   直连吞吐 ≥ DIRECT_MIN_MBPS  → 直连够用，完全不动 uv.lock；
-#   否则实测各镜像，最优者须 ≥ MIRROR_MIN_MBPS 且 ≥ MIRROR_MIN_RATIO × 直连
-#   才改写（避免为微小差距去动锁文件），改写前仍做 sha256 一致性校验。
+MIRROR_PROBE_PATH=""    # speed-sample path (smallest artifact >=512KB)
+MIRROR_PROBE_HASH=""    # sha256 of the verify sample (smallest file, proves identical bytes)
+MIRROR_VERIFY_PATH=""   # verify-sample path
+# auto judges throughput, not elapsed time. An earlier version treated
+# "smallest file (types-certifi, 2KB) downloads in <= 1.5s" as healthy.
+# 2KB finishes in 0.6s, which measures latency, so a 49 KB/s link was
+# called healthy and the mirror was skipped. A real dep such as uvloop
+# (1.3MiB) then took 27.7s. Now:
+#   direct >= DIRECT_MIN_MBPS  -> leave uv.lock alone;
+#   otherwise measure mirrors; the winner must be >= MIRROR_MIN_MBPS and
+#   >= MIRROR_MIN_RATIO times direct before rewriting (a tiny gap is not
+#   worth touching the lock), and the sha256 check still runs first.
 DIRECT_MIN_MBPS="${DIRECT_MIN_MBPS:-2}"
 MIRROR_MIN_MBPS="${MIRROR_MIN_MBPS:-1}"
 MIRROR_MIN_RATIO="${MIRROR_MIN_RATIO:-1.5}"
@@ -692,13 +887,15 @@ mirror_base_for() {
     esac
 }
 
-# 从 uv.lock 里挑两个探测样本（同一份文件在所有镜像上都存在）：
-#   VERIFY —— 体积最小的发行包，用于完整下载 + sha256 比对，证明「镜像与 PyPI
-#             是同一份字节」。只有校验通过的基址才会被写进 uv.lock。
-#   SPEED  —— ≥512KB 中最小的一个，用于量吞吐。样本必须够大才反映带宽：早期
-#             版本拿最小文件（实测只有 2KB 的 types-certifi）量耗时，而 2KB 在
-#             0.6s 内下完量到的是握手延迟、不是吞吐，于是把 49 KB/s 的链路判成
-#             「直连健康」并跳过镜像。没有 ≥512KB 的制品时退回最大者。
+# Pick two probe samples from uv.lock (the same file exists on every mirror):
+#   VERIFY —— smallest distribution. Full download + sha256, proving the
+#             mirror bytes match PyPI. Only a base that passes is written
+#             into uv.lock.
+#   SPEED  —— smallest artifact >= 512KB, used to measure throughput. The
+#             sample has to be large enough to reflect bandwidth: the 2KB
+#             types-certifi sample finished in 0.6s and measured handshake
+#             latency, so a 49 KB/s link was called healthy. Fall back to
+#             the largest artifact when nothing is >= 512KB.
 mirror_probe_sample() {
     awk '
       match($0, /url = "https:\/\/files\.pythonhosted\.org\/[^"]+"/) {
@@ -723,9 +920,10 @@ mirror_probe_sample() {
     ' "$UVLOCK"
 }
 
-# 量吞吐（MB/s）：Range 只取前 1MB，--max-time 6 兜住慢链路。
-# 超时（curl 退出码 28）不算失败——「已收字节 ÷ 已用时间」正是要的吞吐估计，
-# 所以只看响应码与收到的字节数。任何异常都输出 0 并返回非零。
+# Measure throughput (MB/s): a Range request of the first 1MB, --max-time 6.
+# A timeout (curl exit 28) is not a failure: bytes received / time is the
+# estimate we want, so only the status code and byte count matter. Any
+# other error prints 0 and returns non-zero.
 mirror_probe_speed() {
     local base="$1" out code got secs
     out="$(curl -sSL -r 0-1048575 -o /dev/null --max-time 6 \
@@ -739,8 +937,9 @@ mirror_probe_speed() {
     awk -v b="$got" -v t="${secs:-0}" 'BEGIN{ if (t<=0) t=0.001; printf "%.2f", (b/1048576)/t }'
 }
 
-# 完整下载 VERIFY 样本并比对 sha256，通过则输出耗时（秒）。
-# 这是「镜像与 PyPI 同一份字节」的唯一证据，也是改写 uv.lock 的前提。
+# Download the VERIFY sample and compare sha256. On success, print seconds.
+# This is the only proof the mirror bytes match PyPI, and the precondition
+# for rewriting uv.lock.
 mirror_probe_verify() {
     local base="$1" dest="$2" out code elapsed
     out="$(curl -sSL -o "$dest" -w '%{http_code} %{time_total}' --max-time 20 \
@@ -758,38 +957,43 @@ apply_mirror_lock() {
     awk -v base="$MIRROR_BASE" \
         '{ gsub(/https:\/\/files\.pythonhosted\.org\/packages\//, base "/packages/"); print }' \
         "$UVLOCK_BACKUP" > "$UVLOCK"
-    # 把 mtime 拨回原值：PM 的激活戳（pm/environments.py 的 ACTIVATION_INPUTS）
-    # 按 mtime 比对，一旦 uv.lock 的 mtime 变了，下次 `hermes` 启动会误判依赖变更
-    # 而多做一次重新激活。cp -p 已把原 mtime 存进备份，这里直接沿用。
+    # Restore the original mtime. PM's activation stamp
+    # (ACTIVATION_INPUTS in pm/environments.py) compares mtimes, so a
+    # touched uv.lock makes the next `hermes` start re-activate. cp -p
+    # stored the original mtime in the backup; reuse it.
     touch -r "$UVLOCK_BACKUP" "$UVLOCK" 2>/dev/null || true
     LOCK_REWRITTEN=true
     trap 'restore_lock || true' EXIT INT TERM HUP
 }
 
-# 工具链镜像：改写 pm/lock.json 里的整段 URL 前缀。
+# Toolchain mirrors: rewrite whole URL prefixes in pm/lock.json.
 #
-# 收录标准刻意收得很紧——**只放经「PM 真实安装」验证跑通的规则**，理由见下：
-#   候选 https://github.com/astral-sh/python-build-standalone/releases/download/
-#        → https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone/
-#   单独用 curl -L 探测一切正常（200 / 26.7MB / sha256 逐位一致），但放进真实
-#   构建后 PM 报：
-#     ✗ python: install failed: HTTP Error 302: The HTTP server returned a redirect
+# The allow-list is tight. A rule is included only after a real PM install
+# succeeded with it. The rejected candidate:
+#   https://github.com/astral-sh/python-build-standalone/releases/download/
+#        -> https://mirror.nju.edu.cn/github-release/astral-sh/python-build-standalone/
+#   curl -L alone was fine (200 / 26.7MB / sha256 matched), but a real
+#   build made PM report:
+#     x python: install failed: HTTP Error 302: The HTTP server returned a redirect
 #       error that would lead to an infinite loop.
-#   PM 的 pm/downloader.py 用标准 urllib HTTPRedirectHandler，遇到「指回自身」的
-#   302 就判为无限循环并硬失败（curl 会跟，urllib 不会）。NJU 的 CDN 会出现这种
-#   瞬时自指跳转，事后复测又正常——即「平时能用、偶尔炸」。安装脚本炸掉比慢
-#   几分钟严重得多，所以这条不收录。
-#   （uv 托管的那份 CPython 不受影响：走 uv 自己的 HTTP 客户端，
-#     --python-mirror 默认就指向 NJU，实测 25.3MiB/1.92s。）
-# 收录的这条有真实安装背书：20260901 冷 store 构建中 PM 用它下载 node 28.8MiB 成功。
+#   pm/downloader.py uses urllib's HTTPRedirectHandler, which treats a
+#   redirect back to the same URL as an infinite loop and fails hard
+#   (curl follows it; urllib does not). NJU's CDN does that briefly and
+#   then looks fine again. A broken install is worse than a few extra
+#   minutes, so that rule is not included.
+#   uv-managed CPython is unaffected: it uses uv's own HTTP client, and
+#   --python-mirror already points at NJU (measured 25.3MiB / 1.92s).
+# The included rule has a real-install receipt: a cold-store build on
+# 20260901 downloaded node (28.8MiB) through it.
 TOOL_MIRROR_RULES="
 https://nodejs.org/dist/|https://npmmirror.com/mirrors/node/
 "
 
-# 探测必须走 PM 的同一条代码路径：PM 用 urllib 的 HTTPRedirectHandler，
-# curl 会跟随而 urllib 会把「自指 302」判成无限循环。用 curl 探测会得出
-# 「镜像可用」的错误结论（这正是 NJU/python 那条规则当初漏网的原因）。
-tool_mirror_probe() { # $1=镜像基址前缀 $2=相对路径 → 能取到该路径即通过
+# The probe must use PM's code path. PM uses urllib's HTTPRedirectHandler.
+# curl follows a self-redirect 302; urllib treats it as an infinite loop.
+# A curl-only probe reports "mirror works" when it does not. That is how
+# the NJU python rule slipped through.
+tool_mirror_probe() { # $1=mirror prefix $2=relative path; pass when that path is fetchable
     BLL_URL="${1}${2}" "$BOOT_PY" - <<'PY' 2>/dev/null
 import os, urllib.request
 try:
@@ -813,9 +1017,10 @@ apply_tool_mirror_lock() {
     picked="$(mktemp)"
     while IFS='|' read -r src dst; do
         [ -n "${src:-}" ] || continue
-        # 只有 lock 里确实存在该前缀、且镜像上能取到同一相对路径时才改写。
-        # lock.json 是每行一个 "url": "…" 的 JSON，所以取出前缀之后必须截掉
-        # 结尾的引号（以及可能跟随的逗号），否则探测 URL 尾部会多一个 " 而 404。
+        # Rewrite only when the lock contains the prefix and the mirror
+        # can serve the same relative path. lock.json is one "url": "..."
+        # per line, so the trailing quote (and a following comma) must be
+        # stripped or the probe URL 404s.
         rel="$(awk -v p="$src" -v t="$TARGET" '
             {
                 i = index($0, p)
@@ -824,7 +1029,7 @@ apply_tool_mirror_lock() {
                 j = index(tail, "\"")
                 if (j > 0) tail = substr(tail, 1, j - 1)
                 if (first == "") first = tail
-                # lock 里同一前缀下有全平台的制品；优先挑当前平台的那条来探测
+                # the lock lists every platform under one prefix; probe the current platform
                 if (best == "" && index(tail, t) > 0) best = tail
             }
             END { print (best != "" ? best : first) }
@@ -833,7 +1038,7 @@ apply_tool_mirror_lock() {
         if tool_mirror_probe "$dst" "$rel"; then
             printf '%s|%s\n' "$src" "$dst" >> "$picked"
         else
-            warn "工具镜像探测失败，跳过该规则：${dst}"
+            warn "toolchain mirror probe failed, skipping ${dst}"
         fi
     done < "$rules_tmp"
     rm -f "$rules_tmp"
@@ -844,7 +1049,7 @@ apply_tool_mirror_lock() {
     cp -p "$LOCK" "$TOOLLOCK_BACKUP"
     printf '%s' "$TOOLLOCK_SHA_BEFORE" > "$PRISTINE_DIR/pm-lock.json.sha256"
 
-    # 用 Python 的 str.replace 做字面替换（不经正则），只动 URL 子串，其余原样保留
+    # Literal str.replace (not a regex): only the URL substring changes.
     if ! BLL_LOCK="$LOCK" BLL_RULES="$picked" "$BOOT_PY" - <<'PY' 2>/dev/null
 import os
 path = os.environ["BLL_LOCK"]
@@ -859,7 +1064,7 @@ with open(os.environ["BLL_RULES"], encoding="utf-8") as handle:
 open(path, "w", encoding="utf-8").write(data)
 PY
     then
-        warn "pm/lock.json 改写失败，回滚"
+        warn "pm/lock.json rewrite failed; rolled back"
         restore_one_lock "$TOOLLOCK_BACKUP" "$LOCK" "pm/lock.json" "$TOOLLOCK_SHA_BEFORE"
         rm -f "$picked"
         return 0
@@ -874,18 +1079,20 @@ PY
     rm -f "$picked"
     TOOLLOCK_REWRITTEN=true
     trap 'restore_lock || true' EXIT INT TERM HUP
-    ok "pm/lock.json 中 ${applied} 条工具地址已临时改写（原文件已备份，结束后自动还原）"
-    dim "  未列入规则的制品（chromium / ffmpeg / cua-driver 等）没有可用国内镜像，仍走原始地址"
+    ok "rewrote ${applied} toolchain URL(s) in pm/lock.json (restored when this run ends)"
+    dim "  artifacts outside the rewrite rules (chromium / ffmpeg / cua-driver, ...) keep their original URLs"
 }
 
 # -----------------------------------------------------------------------------
-# 可选工具的裁剪（--without / --minimal / --with-browser）
+# Optional-tool opt-out (--without / --minimal / --with-browser)
 # -----------------------------------------------------------------------------
-# PM 把「可选默认工具」（agent-browser、cua-driver）与必需集分开装，并且把用户的
-# 裁剪选择持久化在 <HERMES_HOME>/installs/<key>/declined-packages.json。
-# 关键点：直接用 pm.cli install --without NAME 会让 PM 走「点名安装」分支
-# （full_closure=False），从而不再推进激活戳。所以这里改为**先把裁剪记录写好**，
-# 再跑一次不带参数的完整 install —— 这样既裁掉了工具，又保住了完整的依赖闭包。
+# PM installs optional defaults (agent-browser, cua-driver) apart from the
+# required set and persists the choice in
+# <HERMES_HOME>/installs/<key>/declined-packages.json.
+# pm.cli install --without NAME takes the named-install branch
+# (full_closure=False) and does not advance the activation stamp. Write
+# the opt-out file first, then run a full install with no arguments: the
+# tools stay out and the dependency closure still completes.
 decline_sync() {
     [ -n "$WITHOUT_OPT" ] || [ "$WITH_BROWSER" = true ] || return 0
     BLL_REPO="$REPO" BLL_WITHOUT="$WITHOUT_OPT" BLL_WITH_BROWSER="$WITH_BROWSER" \
@@ -901,15 +1108,17 @@ PY
 }
 
 # -----------------------------------------------------------------------------
-# 工具链下载预检
+# Toolchain download preflight
 # -----------------------------------------------------------------------------
-# 工具制品不在 PyPI 上，--mirror 的地址改写管不到它们；而 github.com /
-# nodejs.org / cdn.playwright.dev 在国内常常只有 0.1~0.3 MB/s。全新机器首次
-# 安装要拉 6~7 个制品、几百 MB，很容易让人以为卡死了。这里在开下载前把
-# 「装什么、从哪来、多大、多久」摊开。全部失败即静默跳过，绝不阻断构建。
-tool_plan() { # 输出 TSV：kind<TAB>name<TAB>url
-    # 把本次将要写下的裁剪（--without / --minimal / --with-browser）一并算进来，
-    # 否则 --minimal 已经把 Chromium 裁掉了，预检还在吓唬用户「162MB 要下 28 分钟」。
+# Tool artifacts are not on PyPI, so --mirror does not cover them.
+# github.com / nodejs.org / cdn.playwright.dev are often 0.1-0.3 MB/s.
+# A first install pulls 6-7 artifacts and hundreds of MB, which looks
+# stuck. Before downloading, print what, from where, how big, and how
+# long. If every probe fails, skip quietly and do not block the build.
+tool_plan() { # print TSV: kind<TAB>name<TAB>url
+    # Include the opt-out this run will write (--without / --minimal /
+    # --with-browser). Otherwise --minimal has already dropped Chromium
+    # and the preflight still warns about a 162MB / 28 minute download.
     BLL_REPO="$REPO" PYTHONHOME= PYTHONPATH="$REPO" \
     BLL_PLAN_WITHOUT="$WITHOUT_OPT" BLL_PLAN_WITH_BROWSER="$WITH_BROWSER" \
     "$BOOT_PY" - <<'PY' 2>/dev/null
@@ -938,9 +1147,9 @@ for kind, group in plan:
             url = artifact.get("url")
             if not url:
                 continue
-            # 与 PM 的下载走同一条重写规则：registry.npmjs.org 会被换成用户配置的
-            # npm 镜像（本脚本默认 npmmirror）。不这样做的话预检会把 npm 系制品
-            # 误判成走 registry.npmjs.org 的慢速直连。
+            # Same rewrite PM uses for downloads: registry.npmjs.org becomes
+            # the configured npm mirror (npmmirror by default). Otherwise
+            # the preflight reports npm artifacts as a slow direct fetch.
             print("%s\t%s\t%s" % (kind, name, npm_registry_url(url, os.environ)))
             break
 PY
@@ -968,12 +1177,12 @@ tool_preflight() {
         return 0
     fi
 
-    info "工具链预检：store 内缺 $_pf_missing 个制品，正在并行测量各来源主机…"
+    info "toolchain preflight: $_pf_missing artifact(s) missing from the store; measuring source hosts..."
     _pf_dir="$(mktemp -d)"
     _pf_rows="$_pf_dir/rows"; _pf_hosts="$_pf_dir/hosts"; _pf_speed="$_pf_dir/speed"
     : > "$_pf_rows"; : > "$_pf_hosts"; : > "$_pf_speed"
 
-    # 第一轮：并行取各制品的 Content-Length（-I -L 跟随跳转，取最后一段的值）
+    # Round 1: fetch each artifact's Content-Length in parallel (-I -L, last hop).
     _pf_i=0
     while IFS="$(printf '\t')" read -r kind name url; do
         [ -n "${name:-}" ] || continue
@@ -992,7 +1201,7 @@ tool_preflight() {
     cat "$_pf_dir"/host.* > "$_pf_hosts" 2>/dev/null || true
     sort -u "$_pf_hosts" > "$_pf_hosts.u" 2>/dev/null && mv "$_pf_hosts.u" "$_pf_hosts"
 
-    # 第二轮：每个主机只测一次，取该主机任一制品的 256KB 采样算吞吐；同样并行
+    # Round 2: one 256KB sample per host, in parallel, to estimate throughput.
     _pf_i=0
     while read -r host; do
         [ -n "${host:-}" ] || continue
@@ -1014,7 +1223,7 @@ tool_preflight() {
     cat "$_pf_dir"/sp.* > "$_pf_speed" 2>/dev/null || true
 
     printf '\n'
-    printf '  %-24s %-13s %-30s %-10s %s\n' '来源主机' '实测吞吐' '缺失制品' '体积' '估算'
+    printf '  %-24s %-13s %-30s %-10s %s\n' 'host' 'throughput' 'missing' 'size' 'estimate'
     printf '  %s\n' '────────────────────────────────────────────────────────────────────────────────────'
     awk -F'\t' '
         FILENAME == ARGV[1] { speed[$1] = $2; next }
@@ -1032,27 +1241,26 @@ tool_preflight() {
                     size_txt = sprintf("%.1f MB", mb)
                     sized = 1
                 } else {
-                    mb = 0; size_txt = "大小未知"
+                    mb = 0; size_txt = "unknown"
                 }
                 sp = (h in speed) ? speed[h] : 0
                 if (sp > 0 && mb > 0) {
                     secs = mb / sp
-                    est = sprintf("%.1f 分钟", secs / 60)
+                    est = sprintf("%.1f min", secs / 60)
                     total_mb += mb; total_s += secs
                 } else if (sp > 0) {
                     est = "—"
                 } else {
                     est = "—"; unreachable = 1
                 }
-                spd = (sp > 0) ? sprintf("%.2f MB/s", sp) : "不可达"
+                spd = (sp > 0) ? sprintf("%.2f MB/s", sp) : "unreachable"
                 printf "  %-24s %-13s %-30s %-10s %s\n", h, spd, names[h], size_txt, est
             }
             printf "  %s\n", "────────────────────────────────────────────────────────────────────────────────────"
             if (total_mb > 0)
-                printf "  可估算部分合计 %.1f MB，预计 %.1f 分钟%s\n", total_mb, total_s / 60, \
-                       (unreachable ? "（另有主机不可达，实际更久）" : "")
+                printf "  sized portion %.1f MB, about %.1f min%s\n", total_mb, total_s / 60, (unreachable ? " (some hosts unreachable)" : "")
             else if (sized == 0)
-                printf "  体积与吞吐均无法测定，跳过耗时估算\n"
+                printf "  size and throughput unknown; skipping the time estimate\n"
         }
     ' "$_pf_speed" "$_pf_rows"
 
@@ -1073,19 +1281,19 @@ tool_preflight() {
     _pf_slowest_secs="${_pf_slow##*	}"
     _pf_dead="$(awk -F'\t' '$2 <= 0 {print $1}' "$_pf_speed" | tr '\n' ' ' | sed 's/ *$//')"
     if [ -n "$_pf_dead" ]; then
-        warn "以下来源当前不可达（连接超时，连不上而非仅慢）：${_pf_dead}"
-        dim "  设代理后重跑：export HTTPS_PROXY=http://127.0.0.1:7890"
+        warn "these hosts are unreachable (connection timeout): ${_pf_dead}"
+        dim "  retry behind a proxy: export HTTPS_PROXY=http://127.0.0.1:7890"
     fi
-    # 只在真的慢（预计超过 3 分钟）时才提示——最慢的那台是本脚本已选用的镜像时，
-    # 再说「没有国内镜像」既不准确也没意义。
+    # Warn only when the estimate exceeds 3 minutes. If the slowest host is
+    # already the mirror this script chose, "no domestic mirror" is wrong.
     if [ -n "$_pf_slowest" ] \
        && awk -v t="${_pf_slowest_secs:-0}" 'BEGIN{exit !(t > 180)}'; then
-        warn "最慢的来源是 ${_pf_slowest}（预计约 $(( _pf_slowest_secs / 60 )) 分钟）"
-        dim "  该来源国内无更快镜像；如需进一步提速可设 HTTPS_PROXY 后重跑"
+        warn "slowest host is ${_pf_slowest} (about $(( _pf_slowest_secs / 60 )) min)"
+        dim "  no faster mirror is wired for that host; set HTTPS_PROXY and rerun to go faster"
     fi
     if ! grep -q '^REQ' "$_pf_miss" && grep -q '^OPT' "$_pf_miss"; then
-        dim "  提示：缺的都是可选工具，其中 Chromium（约 150MB，cdn.playwright.dev 约 0.1 MB/s）"
-        dim "       只被 agent-browser 需要——不需要浏览器自动化时加 --minimal 可直接跳过。"
+        dim "  note: only optional tools are missing. Chromium (~150MB, cdn.playwright.dev)"
+        dim "       is required only by agent-browser. Pass --minimal to skip it."
     fi
     rm -f "$_pf_plan" "$_pf_miss"
     rm -rf "$_pf_dir" 2>/dev/null || true
@@ -1094,13 +1302,25 @@ tool_preflight() {
 if [ "$MIRROR_MODE" != none ]; then
     if [ -n "$NPM_REGISTRY_OPT" ] || [ -n "$MIRROR_BASE_OPT" ] || [ "$SKIP_RUNTIME" != true ]; then
         export npm_config_registry="$NPM_REGISTRY"
-        # PM 在 FORWARDED_UV_SETTINGS 里会把这个值转发给 uv（其余 UV_* 会被剥离）
+        # PM forwards this value to uv via FORWARDED_UV_SETTINGS; other UV_* are stripped.
         export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
     fi
 fi
 
-if [ "$MIRROR_MODE" != none ] && [ "$SKIP_RUNTIME" != true ]; then
-    step "网络探测与镜像选择（--mirror ${MIRROR_MODE}）"
+if [ "$MIRROR_MODE" != none ] && [ "$SKIP_RUNTIME" != true ] \
+   && [ "$MIRROR_MODE" = auto ] && [ -z "$MIRROR_BASE_OPT" ] && load_mirror_choice; then
+    step "PyPI mirror (--mirror auto)"
+    if [ -n "$MIRROR_BASE" ]; then
+        ok "Reusing cached PyPI mirror ${MIRROR_LABEL}: ${MIRROR_BASE}"
+        dim "  skipping the speed probe; delete ${MIRROR_CHOICE} to measure again"
+        apply_mirror_lock
+        ok "uv.lock download URLs rewritten temporarily (restored when this run ends)"
+    else
+        ok "Reusing cached choice: direct PyPI (uv.lock left unchanged)"
+        dim "  delete ${MIRROR_CHOICE} to measure mirrors again"
+    fi
+elif [ "$MIRROR_MODE" != none ] && [ "$SKIP_RUNTIME" != true ]; then
+    step "probing the network and choosing a mirror (--mirror ${MIRROR_MODE})"
 
     PROBE_SAMPLE="$(mirror_probe_sample)"
     MIRROR_VERIFY_PATH="$(printf '%s\n' "$PROBE_SAMPLE" | awk -F'\t' '$1=="VERIFY"{print $2}')"
@@ -1108,25 +1328,25 @@ if [ "$MIRROR_MODE" != none ] && [ "$SKIP_RUNTIME" != true ]; then
     MIRROR_PROBE_PATH="$(printf '%s\n' "$PROBE_SAMPLE" | awk -F'\t' '$1=="SPEED"{print $2}')"
 
     if [ -z "$MIRROR_PROBE_PATH" ] || [ -z "$MIRROR_VERIFY_PATH" ] || [ -z "$MIRROR_PROBE_HASH" ]; then
-        warn "无法从 uv.lock 提取探测样本，跳过镜像改写"
+        warn "could not pick a probe sample from uv.lock; leaving download URLs unchanged"
     else
         PROBE_TMP="$(mktemp)"
         if [ -n "$MIRROR_BASE_OPT" ]; then
             if elapsed="$(mirror_probe_verify "$MIRROR_BASE_OPT" "$PROBE_TMP")"; then
                 MIRROR_BASE="$MIRROR_BASE_OPT"
                 MIRROR_LABEL="${MIRROR_BASE_OPT}"
-                MIRROR_DETAIL="指定基址，样本 sha256 校验通过（${elapsed}s）"
+                MIRROR_DETAIL="given base, sample sha256 matched (${elapsed}s)"
             else
                 rm -f "$PROBE_TMP"
-                die "指定的 --mirror-base 校验失败（下载或 sha256 不符）：${MIRROR_BASE_OPT}"
+                die "given --mirror-base failed (download or sha256): ${MIRROR_BASE_OPT}"
             fi
         elif [ "$MIRROR_MODE" = auto ]; then
             direct_mbps="$(mirror_probe_speed 'https://files.pythonhosted.org' || true)"
             if awk -v s="$direct_mbps" -v min="$DIRECT_MIN_MBPS" 'BEGIN{exit !(s >= min)}'; then
-                MIRROR_LABEL="直连"
-                MIRROR_DETAIL="直连吞吐 ${direct_mbps} MB/s ≥ ${DIRECT_MIN_MBPS} MB/s，无需改写"
+                MIRROR_LABEL="direct"
+                MIRROR_DETAIL="direct throughput ${direct_mbps} MB/s >= ${DIRECT_MIN_MBPS} MB/s; leaving uv.lock unchanged"
             else
-                dim "  直连 files.pythonhosted.org 实测 ${direct_mbps} MB/s（< ${DIRECT_MIN_MBPS} MB/s），改测国内镜像"
+                dim "  direct files.pythonhosted.org is ${direct_mbps} MB/s (< ${DIRECT_MIN_MBPS} MB/s); trying domestic mirrors"
                 best_mbps=0; best_base=""; best_name=""
                 for name in aliyun tencent tuna huawei ustc; do
                     base="$(mirror_base_for "$name")"
@@ -1140,20 +1360,20 @@ if [ "$MIRROR_MODE" != none ] && [ "$SKIP_RUNTIME" != true ]; then
                 if [ -n "$best_base" ] \
                    && awk -v s="$best_mbps" -v min="$MIRROR_MIN_MBPS" 'BEGIN{exit !(s >= min)}' \
                    && awk -v s="$best_mbps" -v d="$direct_mbps" -v r="$MIRROR_MIN_RATIO" 'BEGIN{exit !(s >= d * r)}'; then
-                    # 只有 sha256 校验通过才改写：这一步保证镜像与 PyPI 是同一份字节
+                    # Rewrite only after sha256 matches: the mirror bytes equal PyPI.
                     if elapsed="$(mirror_probe_verify "$best_base" "$PROBE_TMP")"; then
                         speedup="$(awk -v a="$best_mbps" -v b="$direct_mbps" \
                             'BEGIN{ if (b <= 0) b = 0.01; printf "%.0f", a / b }')"
                         MIRROR_BASE="$best_base"
                         MIRROR_LABEL="$best_name"
-                        MIRROR_DETAIL="直连 ${direct_mbps} MB/s → ${best_name} ${best_mbps} MB/s，约 ${speedup} 倍"
+                        MIRROR_DETAIL="direct ${direct_mbps} MB/s -> ${best_name} ${best_mbps} MB/s, about ${speedup}x"
                     else
-                        warn "${best_name} 样本 sha256 校验失败，保持直连（不改写 uv.lock）"
-                        MIRROR_DETAIL="最优镜像校验失败，保持直连"
+                        warn "${best_name} sample sha256 failed; staying on direct PyPI"
+                        MIRROR_DETAIL="fastest mirror failed verification; staying on direct PyPI"
                     fi
                 else
-                    warn "镜像未显著快于直连（最优 ${best_mbps} MB/s vs 直连 ${direct_mbps} MB/s），保持直连"
-                    MIRROR_DETAIL="镜像未显著更快，保持直连"
+                    warn "mirrors are not meaningfully faster (${best_mbps} MB/s vs direct ${direct_mbps} MB/s); staying direct"
+                    MIRROR_DETAIL="mirrors are not meaningfully faster; staying direct"
                 fi
             fi
         else
@@ -1161,23 +1381,24 @@ if [ "$MIRROR_MODE" != none ] && [ "$SKIP_RUNTIME" != true ]; then
             if elapsed="$(mirror_probe_verify "$base" "$PROBE_TMP")"; then
                 MIRROR_BASE="$base"
                 MIRROR_LABEL="$MIRROR_MODE"
-                MIRROR_DETAIL="指定镜像，样本 sha256 校验通过（${elapsed}s）"
+                MIRROR_DETAIL="selected mirror, sample sha256 matched (${elapsed}s)"
             else
                 rm -f "$PROBE_TMP"
-                die "镜像 ${MIRROR_MODE}（${base}）校验失败：下载失败或 sha256 不一致"
+                die "mirror ${MIRROR_MODE} (${base}) failed: download error or sha256 mismatch"
             fi
         fi
         rm -f "$PROBE_TMP"
 
         if [ -n "$MIRROR_BASE" ]; then
-            ok "使用镜像 ${MIRROR_LABEL}：${MIRROR_BASE}"
+            ok "using mirror ${MIRROR_LABEL}: ${MIRROR_BASE}"
             dim "  ${MIRROR_DETAIL}"
-            dim "  探测样本 sha256 与 uv.lock 记录一致（镜像是同一份字节）"
+            dim "  probe sample sha256 matches uv.lock (same bytes as PyPI)"
             apply_mirror_lock
-            ok "uv.lock 下载地址已临时改写（原文件已备份，结束后自动还原）"
+            ok "uv.lock download URLs rewritten temporarily (restored when this run ends)"
         else
             dim "  ${MIRROR_DETAIL}"
         fi
+        save_mirror_choice
     fi
 fi
 
@@ -1185,64 +1406,67 @@ if [ "$MIRROR_MODE" != none ] && [ "$NPM_REGISTRY_OPT" != "" ]; then
     dim "  npm registry → ${NPM_REGISTRY}"
 fi
 
-# --mirror-index：把「解析索引」也指向镜像。注意这与上面的下载地址改写是两件事：
-#   下载（wheel/sdist 本体）由 uv.lock 里的绝对 URL 决定 —— 只能靠改写；
-#   解析（build-isolation 的构建后端依赖、sdist 构建时的依赖）才走索引。
-# PM 的 pm/index_config.py 会把 UV_INDEX_URL / UV_DEFAULT_INDEX / PIP_INDEX_URL
-# 转发给 uv，其余 UV_* 会被剥离。
-# 默认关闭：本仓库 pyproject.toml 设了 exclude-newer（按上传时间过滤），而部分
-# 国内镜像未提供完整的 upload-time 元数据，一旦触发重新解析会报
-# 「has no publish time」。所以只在明确需要时打开。
+# --mirror-index also points resolution at the mirror. That is separate
+# from the download-URL rewrite above:
+#   downloads (wheel/sdist bytes) come from absolute URLs in uv.lock;
+#   resolution (build-isolation backends, sdist build deps) uses the index.
+# pm/index_config.py forwards UV_INDEX_URL / UV_DEFAULT_INDEX /
+# PIP_INDEX_URL to uv and strips every other UV_*.
+# Off by default: pyproject.toml sets exclude-newer (filter by upload
+# time), and some domestic mirrors omit upload-time metadata. A re-resolve
+# then fails with "has no publish time". Turn it on only when you need it.
 if [ "$MIRROR_INDEX" = true ]; then
     if [ -n "$MIRROR_BASE" ]; then
         MIRROR_SIMPLE="${MIRROR_BASE%/}/simple"
         export UV_INDEX_URL="$MIRROR_SIMPLE"
         export UV_DEFAULT_INDEX="$MIRROR_SIMPLE"
         export PIP_INDEX_URL="$MIRROR_SIMPLE"
-        ok "解析索引已指向 ${MIRROR_SIMPLE}"
-        dim "  只影响解析与 sdist 构建依赖；--frozen 的 wheel 仍走改写后的下载地址"
+        ok "resolution index set to ${MIRROR_SIMPLE}"
+        dim "  affects resolution and sdist build deps only; frozen wheels still use the rewritten URLs"
     else
-        warn "--mirror-index 已忽略：当前是直连，没有可用的镜像索引"
+        warn "--mirror-index ignored: staying on direct PyPI, so there is no mirror index"
     fi
 fi
 
 # -----------------------------------------------------------------------------
-# 步骤 1：引导 Python 运行时（uv → CPython → PM 依赖同步）
+# Step 1: bootstrap the Python runtime (uv -> CPython -> PM install)
 # -----------------------------------------------------------------------------
 if [ "$SKIP_RUNTIME" = true ]; then
-    step "跳过运行时引导（--skip-runtime）"
-    [ -n "$BOOT_PY" ] || die "工具 store 中没有可用 Python，无法跳过运行时引导"
-    ok "复用 store Python：$BOOT_PY"
+    step "skipping the runtime bootstrap (--skip-runtime)"
+    [ -n "$BOOT_PY" ] || die "no Python in the tool store; cannot skip the runtime bootstrap"
+    ok "reusing store Python: $BOOT_PY"
 else
-    step "引导 Python 运行时（uv → CPython → PM 依赖同步）"
+    step "bootstrapping the Python runtime (uv -> CPython -> PM install)"
     UV=""
     if [ -n "$BOOT_PY" ]; then
-        ok "复用 store Python：$BOOT_PY"
+        ok "reusing store Python: $BOOT_PY"
     else
         stage_uv
         PY_REQUEST="$(pin version python | cut -d+ -f1 | cut -d. -f1,2)"
-        [ -n "$PY_REQUEST" ] || die "pm/lock.json 中缺少 python 的版本 pin"
+        [ -n "$PY_REQUEST" ] || die "pm/lock.json has no python version pin"
+        mkdir -p "$UV_PYTHON_INSTALL_DIR"
         if [ -n "$PYTHON_MIRROR_OPT" ]; then
             export UV_PYTHON_INSTALL_MIRROR="$PYTHON_MIRROR_OPT"
-            dim "  CPython 下载镜像：${UV_PYTHON_INSTALL_MIRROR}"
+            dim "  CPython download mirror: ${UV_PYTHON_INSTALL_MIRROR}"
         fi
-        info "安装 CPython $PY_REQUEST ..."
+        info "installing CPython $PY_REQUEST ..."
         "$UV" python install --no-bin --no-registry "$PY_REQUEST"
         BOOT_PY="$("$UV" python find --managed-python "$PY_REQUEST")"
         BOOT_PY="${BOOT_PY%$'\r'}"
-        [ -n "$BOOT_PY" ] && [ -x "$BOOT_PY" ] || die "无法定位被托管的 Python 解释器"
-        ok "引导 Python：$BOOT_PY"
+        [ -n "$BOOT_PY" ] && [ -x "$BOOT_PY" ] || die "could not locate the managed Python interpreter"
+        ok "bootstrap Python: $BOOT_PY"
     fi
 
     if [ "$SHARED_STORE" = true ]; then
-        dim "  工具 store 为共享复用：pm 只按「版本+平台」新增条目，不会删除既有条目"
-        dim "  构建结束会对比 store 条目增删，任何写入都会明确列出"
+        dim "  shared tool store: pm only adds version+platform entries and does not delete existing ones"
+        dim "  the build compares store entries at the end and lists every write"
     fi
 
-    step "工具链预检与可选工具裁剪"
+    step "toolchain preflight and optional-tool selection"
 
-    # 先应用工具镜像改写，再预检：这样预检测到的是**实际会用的地址**，
-    # 否则会把已被改写掉的慢源（比如 nodejs.org）当成真实来源报出来。
+    # Apply the toolchain rewrite before the preflight, so the report
+    # shows the URL that will actually be used (not nodejs.org after it
+    # has already been rewritten).
     if [ "$TOOL_MIRROR" != none ]; then
         apply_tool_mirror_lock
     fi
@@ -1251,31 +1475,33 @@ else
 
     DECLINED_NOW="$(decline_sync | awk -F'\t' '$1=="declined"{print $2}')"
     if [ -n "$DECLINED_NOW" ]; then
-        ok "本次跳过可选工具：${DECLINED_NOW}"
-        dim "  该选择被 PM 记在 <HERMES_HOME>/installs/<key>/declined-packages.json，后续 install/update 沿用"
-        dim "  想装回来：--with-browser（或删掉上面那个文件）"
+        ok "skipping optional tools: ${DECLINED_NOW}"
+        dim "  PM records that choice in <HERMES_HOME>/installs/<key>/declined-packages.json and reuses it"
+        dim "  install them again with --with-browser (or delete that file)"
     elif [ "$WITH_BROWSER" = true ]; then
-        ok "已清除可选用具的裁剪记录，将完整安装"
+        ok "cleared the optional-tool opt-out; installing the full set"
     fi
 
-    info "同步依赖（python -m pm.cli install，首次可能耗时 1-5 分钟）..."
+    seed_python_mirror
+
+    info "syncing dependencies (python -m pm.cli install; first run can take 1-5 minutes)..."
     pm_args=(install)
     [ "$WITH_TEST_ENV" = true ] && pm_args+=(--test-environment)
-    # 在仓库根执行：`python -m` 依赖 CWD 找到 pm 包（同 setup-hermes.sh）
+    # Run from the repo root: `python -m` finds the pm package via CWD (same as setup-hermes.sh).
     ( cd "$REPO" && PYTHONHOME= PYTHONPATH= "$BOOT_PY" -m pm.cli "${pm_args[@]}" ) \
-        || die "PM 安装失败（见上方输出）"
-    ok "依赖已同步"
+        || die "PM install failed (see the output above)"
+    ok "dependencies synced"
 
-    # 下载已结束，立刻把被改写的锁文件还原，缩短改写窗口（trap 仍是兜底）
+    # Downloads are done; restore the lockfiles now. The trap is the fallback.
     if [ "$LOCK_REWRITTEN" = true ] || [ "$TOOLLOCK_REWRITTEN" = true ]; then
         restore_lock
     fi
 fi
 
 # -----------------------------------------------------------------------------
-# 步骤 2：加载 PM 组合环境（node / npm / ripgrep / ffmpeg / 工具 PATH）
+# Step 2: load the PM environment (node / npm / ripgrep / ffmpeg / tool PATH)
 # -----------------------------------------------------------------------------
-step "读取 PM 组合环境"
+step "loading the PM environment"
 
 PM_ENV_SH="$(PYTHONHOME= PYTHONPATH="$REPO" "$BOOT_PY" -m pm.environments | PYTHONHOME= PYTHONPATH="$REPO" "$BOOT_PY" -c '
 import json, re, shlex, sys
@@ -1283,12 +1509,12 @@ for key, value in json.load(sys.stdin).items():
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
         continue
     print("export %s=%s" % (key, shlex.quote(str(value))))
-')" || die "无法读取 PM 组合环境（pm.environments 失败）"
-[ -n "$PM_ENV_SH" ] || die "PM 组合环境为空"
+')" || die "could not read the PM environment (pm.environments failed)"
+[ -n "$PM_ENV_SH" ] || die "PM environment is empty"
 eval "$PM_ENV_SH"
-ok "PM 环境已加载"
+ok "PM environment loaded"
 
-# 解析 PM 选定的应用解释器：核心依赖装在它下面，Pillow / resvg-py 只在它里面
+# Resolve the interpreter PM selected. Core deps, and Pillow / resvg-py, live there.
 APP_PY="$(PYTHONHOME= PYTHONPATH="$REPO" "$BOOT_PY" -c '
 import sys
 from pathlib import Path
@@ -1306,14 +1532,14 @@ else:
 ' "$REPO" 2>/dev/null || true)"
 
 if [ -n "$APP_PY" ] && [ -x "$APP_PY" ]; then
-    ok "应用解释器：$APP_PY"
+    ok "app interpreter: $APP_PY"
 else
     APP_PY="${PYTHON:-python3}"
-    warn "未能解析 PM 选定的解释器，回退到：$APP_PY"
+    warn "could not resolve the PM interpreter; falling back to: $APP_PY"
 fi
 
 if ! "$APP_PY" -c 'import httpx, pydantic, fastapi' 2>/dev/null; then
-    warn "核心依赖导入校验未通过（httpx / pydantic / fastapi），请检查上方 PM 输出"
+    warn "core import check failed (httpx / pydantic / fastapi); see the PM output above"
 fi
 
 HAS_NODE=false
@@ -1321,135 +1547,150 @@ if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
     HAS_NODE=true
     ok "Node $(node --version) / npm $(npm --version)"
 else
-    warn "PATH 中找不到 node/npm，前端编译将跳过"
+    warn "node/npm not on PATH; skipping frontend builds"
 fi
 
 # -----------------------------------------------------------------------------
-# 步骤 3-7：JS 依赖 + 前端编译
+# Steps 3-7: JS dependencies and frontend builds
 # -----------------------------------------------------------------------------
 BUILT_TUI=false
 BUILT_WEB=false
 BUILT_DESKTOP=false
 
 if [ "$SKIP_JS" = true ]; then
-    step "跳过前端编译（--skip-js）"
+    step "skipping frontend builds (--skip-js)"
 elif [ "$HAS_NODE" = false ]; then
-    step "跳过前端编译（缺少 node/npm）"
+    step "skipping frontend builds (node/npm missing)"
 else
-    step "安装 JS 依赖（根目录 npm ci，覆盖全部 workspace）"
-    # --- 二进制 postinstall 的国内镜像 ---
-    # npm ci 的包体已经走 registry 镜像，但有些包的 postinstall 会**绕开 registry**
-    # 直接去 GitHub Releases 拉预编译二进制，registry 配置对它们完全无效：
-    #   electron@40.10.2 → github.com/electron/electron/releases/…darwin-arm64.zip
-    #     109 MiB，本机实测 connect ETIMEDOUT (20.205.243.166:443)
-    #   node-gyp（node-pty 回退到本地编译时用）→ nodejs.org 的头文件，0.04 MB/s
+    step "Installing JS dependencies (workspace root)"
+    export npm_config_cache="${npm_config_cache:-$OUT/cache/npm}"
+    mkdir -p "$npm_config_cache"
+    # --- domestic mirrors for binary postinstalls ---
+    # npm ci package bodies already use the registry mirror, but some
+    # postinstall scripts fetch prebuilt binaries from GitHub Releases.
+    # Registry settings do not apply to them:
+    #   electron@40.10.2 -> github.com/electron/electron/releases/...darwin-arm64.zip
+    #     109 MiB, measured connect ETIMEDOUT (20.205.243.166:443)
+    #   node-gyp (when node-pty falls back to a local compile) -> nodejs.org
+    #     headers, 0.04 MB/s
     #
-    # 桌面端编译本来就是 opt-in（--with-desktop），默认构建用不到 Electron 的运行时
-    # 二进制，所以默认直接跳过下载：electron/install.js 第 14 行的
-    # ELECTRON_SKIP_BINARY_DOWNLOAD 会在任何网络动作之前 exit 0。只有 --with-desktop
-    # 才真正下载，并改走 npmmirror（实测 1.76 MB/s，109 MiB 约 1 分钟；
-    # 校验用的是包内自带的 checksums.json，不依赖镜像提供的 SHASUMS256.txt）。
+    # Desktop is opt-in (--with-desktop). The default build does not need
+    # the Electron runtime, so the download is skipped: line 14 of
+    # electron/install.js exits 0 on ELECTRON_SKIP_BINARY_DOWNLOAD before
+    # any network. --with-desktop downloads from npmmirror (measured
+    # 1.76 MB/s, ~1 minute for 109 MiB). Verification uses the package's
+    # own checksums.json, not the mirror's SHASUMS256.txt.
     export NODEJS_ORG_MIRROR="${NODEJS_ORG_MIRROR:-https://npmmirror.com/mirrors/node/}"
     if [ "$WITH_DESKTOP" = true ]; then
-        # 置空而非 unset：Node 读到的空串是 falsy，install.js 会照常下载
+        # Empty, not unset: Node treats "" as falsy and install.js downloads normally.
         export ELECTRON_SKIP_BINARY_DOWNLOAD=""
         export ELECTRON_BUILDER_BINARIES_MIRROR="${ELECTRON_BUILDER_BINARIES_MIRROR:-https://npmmirror.com/mirrors/electron-builder-binaries/}"
         if [ "$ELECTRON_MIRROR_OPT" = none ]; then
-            dim "  Electron 二进制：GitHub 官方源（--electron-mirror none）"
+            dim "  Electron binary: GitHub (--electron-mirror none)"
         else
             export ELECTRON_MIRROR="${ELECTRON_MIRROR_OPT:-${ELECTRON_MIRROR:-https://npmmirror.com/mirrors/electron/}}"
-            dim "  Electron 二进制：${ELECTRON_MIRROR}（约 109 MiB）"
+            dim "  Electron binary: ${ELECTRON_MIRROR} (~109 MiB)"
         fi
     else
         export ELECTRON_SKIP_BINARY_DOWNLOAD="${ELECTRON_SKIP_BINARY_DOWNLOAD:-1}"
-        dim "  跳过 Electron 运行时二进制（默认不编译桌面端；要装加 --with-desktop）"
+        dim "  skipping the Electron runtime binary (desktop is off unless you pass --with-desktop)"
     fi
 
-    ( cd "$REPO" && npm ci ) || die "npm ci 失败"
-    ok "JS 依赖已安装"
+    # npm ci deletes node_modules. Skip it when the installed tree already
+    # matches package-lock.json; the npm cache under <out>/cache/npm covers
+    # the case where the tree is missing or the lock changed.
+    if [ -d "$REPO/node_modules" ] \
+       && [ -f "$REPO/package-lock.json" ] \
+       && [ -f "$REPO/node_modules/.package-lock.json" ] \
+       && [ "$(hash_of "$REPO/package-lock.json")" = "$(hash_of "$REPO/node_modules/.package-lock.json")" ]; then
+        ok "Reusing node_modules (package-lock.json unchanged)"
+    else
+        ( cd "$REPO" && npm ci ) || die "npm ci failed"
+        ok "JS dependencies installed"
+    fi
 
-    step "生成图标（scripts/generate_icons.py）"
+    step "generating icons (scripts/generate_icons.py)"
     rm -rf "$ICONS_DIR"
     mkdir -p "$ICONS_DIR"
     "$APP_PY" "$REPO/scripts/generate_icons.py" --source "$REPO" --out "$ICONS_DIR" \
-        || die "图标生成失败"
-    ok "图标 → $ICONS_DIR"
+        || die "icon generation failed"
+    ok "icons -> $ICONS_DIR"
 
-    step "编译 TUI（ui-tui → products/tui）"
+    step "building the TUI (ui-tui -> products/tui)"
     node "$REPO/scripts/build/tui.mjs" --source "$REPO" --out "$PRODUCTS_DIR/tui" \
-        || die "TUI 编译失败"
-    [ -f "$PRODUCTS_DIR/tui/dist/entry.js" ] || die "TUI 产物缺少 dist/entry.js"
+        || die "TUI build failed"
+    [ -f "$PRODUCTS_DIR/tui/dist/entry.js" ] || die "TUI output is missing dist/entry.js"
     ok "TUI → $PRODUCTS_DIR/tui/dist/entry.js"
     BUILT_TUI=true
 
-    step "编译 Dashboard（web → products/web）"
+    step "building the dashboard (web -> products/web)"
     node "$REPO/scripts/build/web.mjs" --source "$REPO" \
         --out "$PRODUCTS_DIR/web" --icons "$ICONS_DIR" \
-        || die "Dashboard 编译失败"
-    [ -f "$PRODUCTS_DIR/web/index.html" ] || die "Dashboard 产物缺少 index.html"
+        || die "dashboard build failed"
+    [ -f "$PRODUCTS_DIR/web/index.html" ] || die "dashboard output is missing index.html"
     ok "Dashboard → $PRODUCTS_DIR/web/index.html"
     BUILT_WEB=true
 
     if [ "$WITH_DESKTOP" = true ]; then
-        step "编译桌面端（Electron，耗时最长）"
-        dim "  会编译 node-pty 等原生模块，并写入 apps/desktop/{dist,build}"
+        step "building the desktop app (Electron; slowest step)"
+        dim "  compiles native modules such as node-pty and writes apps/desktop/{dist,build}"
         if [ ! -f "$REPO/apps/desktop/node_modules/electron/path.txt" ]; then
-            warn "未检测到 Electron 运行时二进制（apps/desktop/node_modules/electron/path.txt）"
-            dim "  打包时会缺 Electron；修复：cd $REPO && npm run install:desktop"
+            warn "Electron runtime binary not found (apps/desktop/node_modules/electron/path.txt)"
+            dim "  packaging will miss Electron. Fix: cd $REPO && npm run install:desktop"
         fi
-        ( cd "$REPO" && npm run build --workspace apps/desktop ) || die "桌面端编译失败"
+        ( cd "$REPO" && npm run build --workspace apps/desktop ) || die "desktop build failed"
         rm -rf "$PRODUCTS_DIR/desktop"
         mkdir -p "$PRODUCTS_DIR/desktop"
         cp -R "$REPO/apps/desktop/dist/." "$PRODUCTS_DIR/desktop/"
-        ok "桌面端 → $PRODUCTS_DIR/desktop"
+        ok "desktop -> $PRODUCTS_DIR/desktop"
         BUILT_DESKTOP=true
     fi
 fi
 
 # -----------------------------------------------------------------------------
-# 步骤 8：同步内置 skills（尽力而为）
+# Step 8: sync built-in skills (best effort)
 # -----------------------------------------------------------------------------
 if [ -d "$REPO/skills" ]; then
-    step "同步内置 skills 到 $HERMES_HOME/skills"
+    step "syncing built-in skills to $HERMES_HOME/skills"
     if "$APP_PY" -m tools.skills_sync >/dev/null 2>&1; then
-        ok "skills 已同步"
+        ok "skills synced"
     else
         mkdir -p "$HERMES_HOME/skills"
         cp -Rn "$REPO/skills/." "$HERMES_HOME/skills/" 2>/dev/null || true
-        warn "tools.skills_sync 未成功，已回退为直接复制"
+        warn "tools.skills_sync failed; copied the skill tree instead"
     fi
 fi
 
 # -----------------------------------------------------------------------------
-# 步骤 9：.env
+# Step 9: .env
 # -----------------------------------------------------------------------------
 if [ "$COPY_ENV" = true ] && [ -f "$HOME/.hermes/.env" ]; then
-    step "复制密钥到开发 HERMES_HOME（--copy-env）"
+    step "copying secrets into the dev HERMES_HOME (--copy-env)"
     cp "$HOME/.hermes/.env" "$HERMES_HOME/.env"
     chmod 600 "$HERMES_HOME/.env" 2>/dev/null || true
     ok "$HERMES_HOME/.env"
 elif [ "$COPY_ENV" = true ]; then
-    warn "未找到 $HOME/.hermes/.env（本机没有可复制的正式安装），改从 .env.example 生成模板"
+    warn "no $HOME/.hermes/.env to copy; generating a template from .env.example"
     if [ ! -f "$HERMES_HOME/.env" ] && [ -f "$REPO/.env.example" ]; then
         cp "$REPO/.env.example" "$HERMES_HOME/.env"
         chmod 600 "$HERMES_HOME/.env" 2>/dev/null || true
-        ok "已生成 $HERMES_HOME/.env，请填入 API key（或稍后运行 hermes setup）"
+        ok "wrote $HERMES_HOME/.env; add an API key or run hermes setup"
     fi
 elif [ ! -f "$HERMES_HOME/.env" ] && [ -f "$REPO/.env.example" ]; then
     cp "$REPO/.env.example" "$HERMES_HOME/.env"
     chmod 600 "$HERMES_HOME/.env" 2>/dev/null || true
-    ok "已从 .env.example 生成模板：$HERMES_HOME/.env（需自行填 key，或用 --copy-env）"
+    ok "wrote a template from .env.example: $HERMES_HOME/.env (fill in keys, or use --copy-env)"
 fi
 
 # -----------------------------------------------------------------------------
-# 步骤 10：发布启动器 + 生成 activate.sh
+# Step 10: publish launchers and write activate.sh
 # -----------------------------------------------------------------------------
-step "发布启动器到 $BIN_DIR"
+step "publishing launchers to $BIN_DIR"
 
 PYTHONHOME= PYTHONPATH="$REPO" \
 HERMES_HOME="$HERMES_HOME" HERMES_RUNTIME_DIR="$STORE" \
 BLL_REPO="$REPO" BLL_BIN="$BIN_DIR" BLL_PRODUCTS="$PRODUCTS_DIR" \
-"$BOOT_PY" - <<'PY' || die "启动器发布失败"
+"$BOOT_PY" - <<'PY' || die "launcher publish failed"
 import os, stat, sys
 from pathlib import Path
 
@@ -1475,9 +1716,10 @@ for name in ("hermes", "hermes-acp"):
     path = stage_launcher(name, repo, bin_dir)
     if path is None:
         sys.exit("launcher publication failed: %s" % name)
-    # 上游启动器是多行 exec：shlex.join 把整段 Python bootstrap 包成单个
-    # 引号参数，末尾一行才带上 '"$@"'。只能整段搬运，取单行会把脚本截断成
-    # 未闭合的引号（unexpected EOF）。
+    # The upstream launcher is a multi-line exec: shlex.join wraps the
+    # whole Python bootstrap as one quoted argument, and only the last
+    # line carries '"$@"'. Copy the whole block; one line truncates the
+    # script into an unclosed quote (unexpected EOF).
     text = Path(path).read_text(encoding="utf-8").splitlines()
     if text and text[0].startswith("#!"):
         text = text[1:]
@@ -1485,21 +1727,21 @@ for name in ("hermes", "hermes-acp"):
         text.pop(0)
     if not text or not text[0].startswith("exec "):
         sys.exit("unexpected launcher shape: %s" % path)
-    header = ["#!/bin/sh", "# 由 build-local.sh 生成 —— 绑定本 checkout 的开发环境"]
+    header = ["#!/bin/sh", "# generated by build-local.sh — binds this checkout's dev environment"]
     header += ["export %s=%s" % (k, shlex.quote(v)) for k, v in extra.items()]
     Path(path).write_text("\n".join([*header, *text]) + "\n", encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     print("  " + str(path))
 PY
-ok "启动器已发布"
+ok "launchers published"
 
-step "生成 $OUT/activate.sh"
+step "writing $OUT/activate.sh"
 PYTHONHOME= \
 BLL_OUT="$OUT" BLL_REPO="$REPO" BLL_BOOT_PY="$BOOT_PY" \
 BLL_HOME="$HERMES_HOME" BLL_STORE="$STORE" \
 BLL_BUILT_TUI="$BUILT_TUI" BLL_BUILT_WEB="$BUILT_WEB" \
 BLL_TUI_DIR="$PRODUCTS_DIR/tui" BLL_WEB_DIST="$PRODUCTS_DIR/web" \
-"$BOOT_PY" - <<'PY' || die "activate.sh 生成失败"
+"$BOOT_PY" - <<'PY' || die "activate.sh generation failed"
 import os, shlex
 from pathlib import Path
 
@@ -1514,13 +1756,15 @@ if os.environ["BLL_BUILT_WEB"] == "true":
     optional += "export HERMES_WEB_DIST=%s\n" % shlex.quote(os.environ["BLL_WEB_DIST"])
 
 body = """#!/bin/sh
-# Hermes 本地开发环境 — 由 build-local.sh 生成，请勿手工编辑
-# 用法:  source {out}/activate.sh      离开:  deactivate
+# Hermes local dev environment — generated by build-local.sh, do not edit
+# usage:  source {out}/activate.sh      leave:  deactivate
 #
-# 激活只是「借用」这个 shell：HERMES_HOME 一旦泄漏到 deactivate 之后，生产版本的
-# 启动器（hermes_cli 的 shim）会读它，于是拿「开发 home + 生产 checkout 的 install
-# key」去找依赖环境；找不到就重新下载 Python 依赖。所以先按变量名快照旧值，
-# deactivate 时整段还原（含 PATH 与 pm.environments 导出的 PYTHONPATH 等）。
+# Activation only borrows this shell. If HERMES_HOME leaks past deactivate,
+# the production launcher (the hermes_cli shim) reads it and looks up a
+# dependency env with the dev home plus the production checkout's install
+# key. A miss re-downloads Python dependencies. Snapshot the previous
+# values by name and restore them in deactivate, including PATH and
+# PYTHONPATH exported by pm.environments.
 __hermes_build_out={out_q}
 __hermes_build_repo={repo_q}
 __hermes_boot_py={boot_q}
@@ -1537,7 +1781,7 @@ for key, value in json.load(sys.stdin).items():
 ')"
 fi
 
-# 重复 source 时保留第一次的快照，deactivate 回到真正干净的环境。
+# A second source keeps the first snapshot, so deactivate returns to a clean shell.
 if [ -z "${{__hermes_restore:-}}" ]; then
     __hermes_restore="$(printf '%s\\n' "$__hermes_activation" | "$__hermes_boot_py" -c '
 import os, re, shlex, sys
@@ -1577,10 +1821,10 @@ deactivate() {{
     unset __hermes_activation __hermes_restore
     unset __hermes_build_out __hermes_build_repo __hermes_boot_py __hermes_saved_path
     unset -f deactivate
-    echo "hermes: 已退出本地开发环境（HERMES_HOME / PATH 已还原）"
+    echo "hermes: left the local dev environment (HERMES_HOME / PATH restored)"
 }}
 
-echo "hermes: 本地开发环境已激活 → {out}"
+echo "hermes: local dev environment active -> {out}"
 echo "        hermes / hermes --tui / hermes dashboard / hermes setup"
 """.format(
     out=out,
@@ -1597,19 +1841,19 @@ target.write_text(body, encoding="utf-8")
 target.chmod(0o755)
 print("  " + str(target))
 PY
-ok "激活脚本：source $OUT/activate.sh"
+ok "activate with: source $OUT/activate.sh"
 
 # -----------------------------------------------------------------------------
-# 步骤 11：可选校验
+# Step 11: optional verification
 # -----------------------------------------------------------------------------
 if [ "$DO_VERIFY" = true ]; then
-    step "校验安装状态（python -m pm.cli doctor）"
+    step "checking the install (python -m pm.cli doctor)"
     ( cd "$REPO" && PYTHONHOME= PYTHONPATH= "$BOOT_PY" -m pm.cli doctor ) \
-        || warn "pm doctor 报告了问题（见上方输出）"
+        || warn "pm doctor reported problems (see the output above)"
 fi
 
 # -----------------------------------------------------------------------------
-# 步骤 12：构建清单
+# Step 12: build manifest
 # -----------------------------------------------------------------------------
 GIT_HEAD="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
 GIT_BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
@@ -1624,7 +1868,7 @@ BLL_LOCK_REWRITTEN="$LOCK_REWRITTEN" BLL_MIRROR_INDEX="$MIRROR_INDEX" \
 BLL_DECLINED="$DECLINED_NOW" \
 BLL_BOOT_PY="$BOOT_PY" BLL_APP_PY="$APP_PY" \
 BLL_BUILT_TUI="$BUILT_TUI" BLL_BUILT_WEB="$BUILT_WEB" BLL_BUILT_DESKTOP="$BUILT_DESKTOP" \
-"$BOOT_PY" - <<'PY' || warn "构建清单写入失败"
+"$BOOT_PY" - <<'PY' || warn "could not write the build manifest"
 import json, os, time
 from pathlib import Path
 
@@ -1669,30 +1913,30 @@ manifest = {
 (out / "build-manifest.json").write_text(
     json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 PY
-ok "构建清单：$OUT/build-manifest.json"
+ok "manifest: $OUT/build-manifest.json"
 
 # -----------------------------------------------------------------------------
-# 步骤 13：核对生产安装未被改动
+# Step 13: confirm the production install was not modified
 # -----------------------------------------------------------------------------
 PROD_CHANGED=false
 PROD_DIFF=""
 
 if [ -d "$PROD_HOME" ] && [ -n "${PROD_BEFORE:-}" ] && [ -f "$PROD_BEFORE" ]; then
-    step "核对生产安装（${PROD_HOME}）未被改动"
+    step "checking that the production install (${PROD_HOME}) was not modified"
     PROD_AFTER="$(mktemp)"
     production_fingerprint > "$PROD_AFTER"
     if diff -u "$PROD_BEFORE" "$PROD_AFTER" > /dev/null 2>&1; then
-        ok "生产安装指纹一致，未被本次构建改动"
+        ok "production fingerprint unchanged"
     else
         PROD_CHANGED=true
         PROD_DIFF="$(diff -u "$PROD_BEFORE" "$PROD_AFTER" | sed -n '3,40p')"
-        warn "生产安装指纹发生变化："
+        warn "production fingerprint changed:"
         printf '%s\n' "$PROD_DIFF" | sed 's/^/    /' >&2
-        warn "请逐项确认上述差异是否可接受（共享工具 store 的 facts.json 重写属正常）"
+        warn "review each difference above (a facts.json rewrite in a shared store is expected)"
     fi
     rm -f "$PROD_AFTER"
 
-    # 共享 store 的具体增删（比哈希更可读，直接告诉你多了/少了哪个工具）
+    # Concrete shared-store additions and removals (clearer than a hash).
     if [ "$SHARED_STORE" = true ] && [ -s "$STORE_ENTRIES_BEFORE" ]; then
         STORE_ENTRIES_AFTER="$(mktemp)"
         ( find "$STORE" -maxdepth 1 -mindepth 1 -exec basename {} \; 2>/dev/null \
@@ -1700,15 +1944,15 @@ if [ -d "$PROD_HOME" ] && [ -n "${PROD_BEFORE:-}" ] && [ -f "$PROD_BEFORE" ]; th
         STORE_ADDED="$(comm -13 "$STORE_ENTRIES_BEFORE" "$STORE_ENTRIES_AFTER" || true)"
         STORE_REMOVED="$(comm -23 "$STORE_ENTRIES_BEFORE" "$STORE_ENTRIES_AFTER" || true)"
         if [ -n "$STORE_ADDED" ]; then
-            warn "共享工具 store 新增条目（仅新增，不影响既有安装）："
+            warn "shared tool store gained entries (additions only):"
             printf '%s\n' "$STORE_ADDED" | sed 's/^/    + /' >&2
         fi
         if [ -n "$STORE_REMOVED" ]; then
-            warn "共享工具 store 条目减少（需关注）："
+            warn "shared tool store lost entries:"
             printf '%s\n' "$STORE_REMOVED" | sed 's/^/    - /' >&2
             PROD_CHANGED=true
         fi
-        [ -z "${STORE_ADDED}${STORE_REMOVED}" ] && ok "共享工具 store 条目无增无减"
+        [ -z "${STORE_ADDED}${STORE_REMOVED}" ] && ok "shared tool store entries unchanged"
         rm -f "$STORE_ENTRIES_AFTER"
     fi
 fi
@@ -1716,68 +1960,68 @@ fi
 [ -n "${STORE_ENTRIES_BEFORE:-}" ] && rm -f "$STORE_ENTRIES_BEFORE"
 
 # -----------------------------------------------------------------------------
-# 摘要
+# Summary
 # -----------------------------------------------------------------------------
-printf "\n${C_GREEN}✓ 本地开发版构建完成${C_NC}\n\n"
-printf "  产物根目录        %s\n" "$OUT"
-printf "  启动器            %s/hermes\n" "$BIN_DIR"
-printf "  开发 HERMES_HOME  %s\n" "$HERMES_HOME"
-printf "  工具 store        %s\n" "$STORE"
+printf "\n${C_GREEN}✓ local dev build finished${C_NC}\n\n"
+printf "  output            %s\n" "$OUT"
+printf "  launcher          %s/hermes\n" "$BIN_DIR"
+printf "  dev HERMES_HOME   %s\n" "$HERMES_HOME"
+printf "  tool store        %s\n" "$STORE"
 if [ "$MIRROR_MODE" != none ]; then
     if [ -n "$MIRROR_BASE" ]; then
-        printf "  依赖下载源        %s（%s）\n" "$MIRROR_LABEL" "$MIRROR_BASE"
+        printf "  download source   %s (%s)\n" "$MIRROR_LABEL" "$MIRROR_BASE"
     else
-        printf "  依赖下载源        直连（未改写 uv.lock）\n"
+        printf "  download source   direct (uv.lock not rewritten)\n"
     fi
     printf "  npm registry      %s\n" "$NPM_REGISTRY"
     if [ "$MIRROR_INDEX" = true ] && [ -n "$MIRROR_BASE" ]; then
-        printf "  解析索引          %s\n" "${MIRROR_BASE%/}/simple"
+        printf "  resolution index  %s\n" "${MIRROR_BASE%/}/simple"
     fi
     if [ "$LOCK_REWRITTEN" = true ]; then
-        printf "  uv.lock           %s\n" "仍处于改写状态（异常，请检查）"
+        printf "  uv.lock           %s\n" "still rewritten (unexpected; check the backup)"
     else
-        printf "  uv.lock           已还原，未被改动\n"
+        printf "  uv.lock           restored\n"
     fi
 fi
 if [ -n "$DECLINED_NOW" ]; then
-    printf "  可选工具          已跳过 %s（--with-browser 可装回）\n" "$DECLINED_NOW"
+    printf "  optional tools    skipped %s (reinstall with --with-browser)\n" "$DECLINED_NOW"
 else
-    printf "  可选工具          全部安装\n"
+    printf "  optional tools    all installed\n"
 fi
 [ "$BUILT_TUI" = true ]     && printf "  TUI               %s/tui/dist/entry.js\n" "$PRODUCTS_DIR"
 [ "$BUILT_WEB" = true ]     && printf "  Dashboard         %s/web/index.html\n" "$PRODUCTS_DIR"
-[ "$BUILT_DESKTOP" = true ] && printf "  桌面端            %s/desktop\n" "$PRODUCTS_DIR"
+[ "$BUILT_DESKTOP" = true ] && printf "  desktop           %s/desktop\n" "$PRODUCTS_DIR"
 if [ "${ELECTRON_SKIP_BINARY_DOWNLOAD:-}" = "1" ]; then
-    printf "  Electron 运行时   未下载（默认不编译桌面端；加 --with-desktop 会从 npmmirror 拉取）\n"
+    printf "  Electron runtime  not downloaded (pass --with-desktop to fetch it from npmmirror)\n"
 fi
 if [ "$GIT_HEAD" = unknown ]; then
-    printf "  源码来源          就地使用当前工作区（非 git 检出，全程无 clone）\n"
+    printf "  source            this working tree (not a git checkout; no clone)\n"
 else
-    printf "  源码来源          就地使用当前工作区 %s @ %s（全程无 clone）\n" "$GIT_BRANCH" "${GIT_HEAD:0:12}"
+    printf "  source            this working tree %s @ %s (no clone)\n" "$GIT_BRANCH" "${GIT_HEAD:0:12}"
 fi
 
 if [ -d "$PROD_HOME" ]; then
-    printf "\n  与生产安装的隔离\n\n"
-    printf "    生产家目录        %s\n" "$PROD_HOME"
-    printf "    生产启动器        %s/hermes（未改动）\n" "$PROD_BIN"
-    printf "    依赖代 key        开发 %s ／ 生产 %s\n" "$DEV_INSTALL_KEY" "$PROD_INSTALL_KEY"
-    printf "    launchd 服务名    开发 ai.hermes.gateway-%s ／ 生产 ai.hermes.gateway\n" "$DEV_INSTALL_KEY"
-    printf "    生产指纹          %s\n" "$([ "$PROD_CHANGED" = true ] && echo "有差异（见上方告警）" || echo "一致")"
+    printf "\n  isolation from the production install\n\n"
+    printf "    production home   %s\n" "$PROD_HOME"
+    printf "    production bin    %s/hermes (untouched)\n" "$PROD_BIN"
+    printf "    install key       dev %s / production %s\n" "$DEV_INSTALL_KEY" "$PROD_INSTALL_KEY"
+    printf "    launchd label     dev ai.hermes.gateway-%s / production ai.hermes.gateway\n" "$DEV_INSTALL_KEY"
+    printf "    production hash   %s\n" "$([ "$PROD_CHANGED" = true ] && echo "changed (see the warning above)" || echo "unchanged")"
 fi
 
-printf "\n  下一步\n\n"
+printf "\n  next\n\n"
 printf "    source %s/activate.sh\n" "$OUT"
 printf "    hermes --version\n"
-printf "    hermes setup          # 首次配置模型 / API key（或重跑加 --copy-env）\n"
-printf "    hermes                # 开始对话\n"
-printf "    deactivate            # 退出，并把 HERMES_HOME / PATH 还原成进入前的样子\n"
-printf "                          # （必须执行：HERMES_HOME 残留会让生产版 hermes 去\n"
-printf "                          #   开发 home 里找依赖环境，从而重新下载 Python 依赖）\n\n"
+printf "    hermes setup          # first-time model / API key setup (or rerun with --copy-env)\n"
+printf "    hermes                # start a chat\n"
+printf "    deactivate            # leave and restore HERMES_HOME / PATH\n"
+printf "                          # required: a leftover HERMES_HOME makes the production\n"
+printf "                          # hermes look in the dev home and re-download Python deps)\n\n"
 if [ -d "$PROD_HOME" ]; then
-    printf "  ${C_YELLOW}⚠ 在生产安装共存时，以下命令不要在本开发环境执行：${C_NC}\n\n"
-    printf "    hermes update         # 其 launchd 机群重启会命中裸名 ai.hermes.gateway（即生产服务）\n"
-    printf "    hermes gateway ...    # 生命周期命令请只在生产环境或卸载生产后使用\n\n"
+    printf "  ${C_YELLOW}⚠ with a production install present, do not run these here:${C_NC}\n\n"
+    printf "    hermes update         # its launchd restart hits the bare ai.hermes.gateway label (production)\n"
+    printf "    hermes gateway ...    # lifecycle commands belong in production, or after production is uninstalled\n\n"
 fi
-dim "  提示：.build/ 与 .venv/ 均在 .gitignore 中，不会污染 git 工作区。"
-dim "  提示：无需再 source ./activate，本脚本的 activate.sh 指向同一 PM 环境。"
+dim "  note: .build/ and .venv/ are gitignored."
+dim "  note: do not also source ./activate; this activate.sh points at the same PM environment."
 printf "\n"

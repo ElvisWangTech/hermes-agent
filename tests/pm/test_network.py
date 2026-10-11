@@ -2,6 +2,7 @@
 
 import errno
 import http.client
+import logging
 import socket
 import ssl
 import urllib.error
@@ -58,6 +59,27 @@ def test_only_transient_failures_use_a_finite_retry_budget(error, retried):
     assert len(waits) == expected - 1
     assert all(0 < delay <= network._MAX_DELAY for delay in waits)
     assert waits == sorted(waits)
+
+
+def test_retry_warning_does_not_write_the_terminal_when_logging_is_unconfigured(capsys):
+    """The PM worker has no handlers and inherits the CLI terminal.
+
+    lastResort would splice the retry line into the prompt while the user is typing.
+    """
+    root = logging.getLogger()
+    saved = list(root.handlers)
+    root.handlers.clear()
+    try:
+        def fail():
+            raise TimeoutError("timed out")
+
+        with pytest.raises(TimeoutError):
+            network.retry_network(fail, wait=lambda _delay: None)
+        captured = capsys.readouterr()
+    finally:
+        root.handlers[:] = saved
+    assert "network request failed" not in captured.err
+    assert "network request failed" not in captured.out
 
 
 @pytest.mark.parametrize("retry_after,minimum", [

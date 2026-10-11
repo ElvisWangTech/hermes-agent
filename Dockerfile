@@ -270,13 +270,17 @@ FROM runtime_base AS python_deps
 # is baked so hosted/immutable images can enable the adapter without writing
 # the sealed venv.
 #
+# The [cluster] extra (Redis, boto3, zstd) is baked for the same reason: a
+# sealed image cannot lazy-install it, and an enabled cluster refuses to
+# start without those modules. It stays out of [all].
+#
 # Source binding is created after the source copy below.
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
 RUN python3 -m pm.build_env --source /opt/hermes --python /usr/local/bin/python3 \
     --out /opt/hermes/.venv --no-install-project --sealed \
     --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock \
-    --extra azure-identity --extra matrix --extra google-chat
+    --extra azure-identity --extra matrix --extra google-chat --extra cluster
 
 # Icons render on the runtime environment: Pillow and resvg-py are core
 # dependencies. A stage of its own so the frontend stage keeps building its
