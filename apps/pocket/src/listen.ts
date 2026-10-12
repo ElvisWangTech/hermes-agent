@@ -1,11 +1,13 @@
+import { audioLevel } from './audio'
+
 export interface Ear {
   stop: () => void
   holdStart: () => void
   holdEnd: () => Promise<Blob | null>
 }
 
-export async function openEar(onUtterance: (blob: Blob) => void, live: () => boolean): Promise<Ear> {
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+export async function openEar(onUtterance: (blob: Blob) => void, live: () => boolean, onLevel: (level: number) => void = () => {}, onSpeechStart: () => void = () => {}): Promise<Ear> {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
   const context = new AudioContext()
   const source = context.createMediaStreamSource(stream)
   const analyser = context.createAnalyser()
@@ -24,6 +26,7 @@ export async function openEar(onUtterance: (blob: Blob) => void, live: () => boo
 
   const start = () => {
     if (recorder) return
+    onSpeechStart()
     chunks = []
     recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined)
     recorder.ondataavailable = event => {
@@ -54,22 +57,21 @@ export async function openEar(onUtterance: (blob: Blob) => void, live: () => boo
   }
 
   const tick = () => {
-    if (!live() || holding) {
+    analyser.getByteTimeDomainData(samples)
+    const listening = live()
+    onLevel(listening || holding ? audioLevel(samples) : 0)
+    if (!listening || holding) {
+      if (!holding && recorder) {
+        heard = false
+        quietSince = 0
+        void finish()
+      }
       timer = window.setTimeout(tick, 120)
 
       return
     }
 
-    analyser.getByteTimeDomainData(samples)
-    let sum = 0
-
-    for (const sample of samples) {
-      const centered = (sample - 128) / 128
-
-      sum += centered * centered
-    }
-
-    const loud = Math.sqrt(sum / samples.length) > 0.04
+    const loud = audioLevel(samples) > 0.16
 
     if (loud) {
       heard = true
@@ -94,6 +96,7 @@ export async function openEar(onUtterance: (blob: Blob) => void, live: () => boo
   return {
     stop: () => {
       window.clearTimeout(timer)
+      onLevel(0)
       void finish()
       stream.getTracks().forEach(track => track.stop())
       void context.close()

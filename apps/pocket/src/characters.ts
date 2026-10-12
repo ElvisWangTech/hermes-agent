@@ -25,15 +25,15 @@ export const bands: Band[] = [
 ]
 
 export const characters: Character[] = [
-  portrait('young-0', 'young', 'young-0.jpg'),
-  portrait('young-1', 'young', 'young-1.jpg'),
-  portrait('young-2', 'young', 'young-2.jpg'),
-  portrait('teen-0', 'teen', 'teen-0.jpg'),
-  portrait('teen-1', 'teen', 'teen-1.jpg'),
-  portrait('teen-2', 'teen', 'teen-2.jpg'),
-  portrait('adult-0', 'adult', 'adult-0.jpg'),
-  portrait('adult-1', 'adult', 'adult-1.jpg'),
-  portrait('adult-2', 'adult', 'adult-2.jpg')
+  portrait('young-0', 'young', 'young-0.png'),
+  portrait('young-1', 'young', 'young-1.png'),
+  portrait('young-2', 'young', 'young-2.png'),
+  portrait('teen-0', 'teen', 'teen-0.png'),
+  portrait('teen-1', 'teen', 'teen-1.png'),
+  portrait('teen-2', 'teen', 'teen-2.png'),
+  portrait('adult-0', 'adult', 'adult-0.png'),
+  portrait('adult-1', 'adult', 'adult-1.png'),
+  portrait('adult-2', 'adult', 'adult-2.png')
 ]
 
 export function charactersIn(band: BandId): Character[] {

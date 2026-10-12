@@ -16,7 +16,11 @@ import {
 import { findCharacter, type Mood } from '../characters'
 import { takeSentences, type PocketProfile } from '../flow'
 import { openEar, type Ear } from '../listen'
+import { measurePlayback } from '../audio'
 import { Portrait } from '../Portrait'
+import { Markdown } from '../Markdown'
+import { Waveform } from '../Waveform'
+import { speechText } from '../speech'
 import { rememberSession, setVoiceEnabled, storedSession, voiceEnabled } from '../storage'
 
 interface HomeProps {
@@ -41,7 +45,6 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
   const character = findCharacter(profile.characterId)
   const [mood, setMood] = useState<Mood>('idle')
   const [muted, setMuted] = useState(!voiceEnabled())
-  const [hop, setHop] = useState(false)
   const [caption, setCaption] = useState('')
   const [status, setStatus] = useState('正在过来…')
   const [sheet, setSheet] = useState(false)
@@ -51,6 +54,8 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
   const [reading, setReading] = useState<{ title: string; lines: TurnLine[] } | null>(null)
   const [ask, setAsk] = useState<Ask | null>(null)
   const [voiceNote, setVoiceNote] = useState('')
+  const [inputLevel, setInputLevel] = useState(0)
+  const [outputLevel, setOutputLevel] = useState(0)
   const sessionId = useRef('')
   const clientRef = useRef<Awaited<ReturnType<typeof openGateway>> | null>(null)
   const earRef = useRef<Ear | null>(null)
@@ -73,6 +78,17 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
     pending.current = ''
     audioRef.current?.pause()
     speaking.current = false
+    setOutputLevel(0)
+  }
+
+  const interruptReply = () => {
+    if (!speaking.current && !busyRef.current && !queue.current.length) return
+    stopSpeech()
+    busyRef.current = false
+    setMood(mutedRef.current ? 'wait' : 'idle')
+    if (sessionId.current && clientRef.current) {
+      void interruptSession(clientRef.current, sessionId.current).catch(() => setVoiceNote('停止生成失败，请稍后重试'))
+    }
   }
 
   const pump = async (token: string) => {
@@ -88,26 +104,30 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
     const ticket = generation.current
 
     speaking.current = true
-    setMood('speak')
-    setCaption(current => (current ? `${current}${sentence}` : sentence))
+    setMood('think')
     try {
       const url = await speak(token, sentence)
 
       if (ticket !== generation.current) return
-      await play(url, ticket, generation, audioRef)
+      await play(url, ticket, generation, audioRef, () => {
+        setMood('speak')
+      }, level => {
+        if (ticket === generation.current) setOutputLevel(level)
+      })
     } catch {
+      if (ticket !== generation.current) return
       setVoiceNote('语音还没准备好，可以先打字')
-      setCaption(current => current || sentence)
     } finally {
-      speaking.current = false
-      if (ticket === generation.current) void pump(token)
+      if (ticket === generation.current) {
+        speaking.current = false
+        setOutputLevel(0)
+        void pump(token)
+      }
     }
   }
 
   const enqueue = (sentence: string) => {
     if (mutedRef.current) {
-      setCaption(current => (current ? `${current}${sentence}` : sentence))
-
       return
     }
 
@@ -118,17 +138,21 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
   const say = async (text: string) => {
     const clean = text.trim()
 
-    if (!clean || busyRef.current || !sessionId.current || !clientRef.current) return
+    if (!clean || !sessionId.current || !clientRef.current) return
     stopSpeech()
-    busyRef.current = true
-    setMood('listen')
+    busyRef.current = false
+    setMood('think')
     setTurns(current => [...current, { role: 'user', text: clean }])
     setCaption('')
     pending.current = ''
+    const ticket = generation.current
     try {
       if (sessionId.current) await interruptSession(clientRef.current!, sessionId.current)
+      if (ticket !== generation.current) return
+      busyRef.current = true
       await submitText(clientRef.current!, sessionId.current, clean)
     } catch {
+      if (ticket !== generation.current) return
       busyRef.current = false
       setStatus('这句话没送出去')
       setMood('idle')
@@ -221,36 +245,33 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
         rememberSession(id)
         unwatch = watchTurn(client, id, {
           onDelta: chunk => {
-            busyRef.current = true
+            if (!busyRef.current) return
             pending.current += chunk
-            if (mutedRef.current) {
-              setCaption(current => current + chunk)
-
-              return
-            }
-
-            const split = takeSentences(pending.current)
-
-            pending.current = split.rest
-            split.ready.forEach(enqueue)
+            setCaption(pending.current)
           },
-          onTool: () => setMood('think'),
+          onTool: () => { if (busyRef.current) setMood('think') },
           onComplete: text => {
+            if (!busyRef.current) return
             busyRef.current = false
-            const rest = pending.current.trim()
-            const full = text.trim()
+            const full = (text || pending.current).trim()
 
             pending.current = ''
             if (full) setTurns(current => [...current, { role: 'assistant', text: full }])
-            if (rest) enqueue(rest)
-            else if (mutedRef.current && full) setCaption(full)
-            if (!rest && !queue.current.length) setMood(mutedRef.current ? 'wait' : 'idle')
+            setCaption(full)
+            const spoken = takeSentences(speechText(full))
+            spoken.ready.forEach(enqueue)
+            if (spoken.rest) enqueue(spoken.rest)
+            if (!queue.current.length && !speaking.current) setMood(mutedRef.current ? 'wait' : 'idle')
           }
         })
         setStatus('')
         const ear = await openEar(
           heard,
-          () => !mutedRef.current && !busyRef.current && !holding.current && !speaking.current
+          () => !mutedRef.current && !holding.current && !busyRef.current && !speaking.current,
+          level => {
+            if (!cancelled) setInputLevel(level)
+          },
+          interruptReply
         ).catch(() => {
           setVoiceNote('语音还没准备好，可以先打字')
 
@@ -293,6 +314,7 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
     origin.current = { x: event.clientX, y: event.clientY }
     window.clearTimeout(pressTimer.current)
     pressTimer.current = window.setTimeout(() => {
+      interruptReply()
       holding.current = true
       setMood('listen')
       earRef.current?.holdStart()
@@ -328,13 +350,7 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
 
     if (Math.abs(dx) < 16 && Math.abs(dy) < 16) {
       if (speaking.current || busyRef.current) {
-        stopSpeech()
-        if (sessionId.current && clientRef.current) void interruptSession(clientRef.current, sessionId.current)
-        busyRef.current = false
-        setMood('idle')
-      } else {
-        setHop(true)
-        window.setTimeout(() => setHop(false), 280)
+        interruptReply()
       }
     }
   }
@@ -346,11 +362,11 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
         className="ghost destroy-entry"
         onPointerDown={event => event.stopPropagation()}
         onClick={() => {
-          if (!window.confirm('销毁这个角色？只会清除名字记忆和本地缓存，历史对话不会删除。')) return
-          void onDestroy().catch(() => setVoiceNote('角色还没有销毁，请稍后再试'))
+          if (!window.confirm('清除名字记忆和本地缓存？历史对话、主人资料和角色数据不会删除。')) return
+          void onDestroy().catch(() => setVoiceNote('名字还没有清除，请稍后再试'))
         }}
       >
-        销毁角色
+        清除名字
       </button>
       <button
         type="button"
@@ -366,9 +382,15 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
       >
         以前
       </button>
-      <Portrait character={character} mood={mood} muted={muted} hop={hop} />
+      <Portrait character={character} />
       <section className="lower">
         <p className="who">{profile.name}</p>
+        <p className="note" role="status">{status || (ask ? '等你确认' : mood === 'speak' ? '正在说话' : mood === 'think' ? '正在思考' : inputLevel > 0.16 ? '正在听' : muted ? '麦克风已关闭' : voiceNote ? '文字回复' : '等你开口')}</p>
+        <div className="audio-levels">
+          <Waveform label="你" level={inputLevel} />
+          <Waveform label={profile.name} level={outputLevel} />
+        </div>
+        {mood === 'speak' || mood === 'think' ? <button type="button" className="ghost" onPointerDown={event => event.stopPropagation()} onPointerUp={event => event.stopPropagation()} onClick={interruptReply}>停止回复</button> : null}
         <Caption text={status || caption} fallback={muted ? '她听不见了。点麦克风，或者上滑打字。' : '点一下，或者按住跟她说'} live={speaking.current} />
         {voiceNote ? <p className="note">{voiceNote}</p> : null}
         {status.startsWith('接不上') ? (
@@ -388,10 +410,10 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
           </button>
           <div className="log">
             {turns.map((turn, index) => (
-              <p key={`${turn.role}-${index}`}>
-                <span>{turn.role === 'user' ? '你' : profile.name}</span>
-                {turn.text}
-              </p>
+              <div className="message" key={`${turn.role}-${index}`}>
+                <span className="speaker">{turn.role === 'user' ? '你' : profile.name}</span>
+                <Markdown text={turn.text} />
+              </div>
             ))}
           </div>
           <form
@@ -417,10 +439,10 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
               <h1>{reading.title}</h1>
               <div className="log">
                 {reading.lines.map((line, index) => (
-                  <p key={`${line.role}-${index}`}>
-                    <span>{line.role === 'user' ? '你' : profile.name}</span>
-                    {line.text}
-                  </p>
+                  <div className="message" key={`${line.role}-${index}`}>
+                    <span className="speaker">{line.role === 'user' ? '你' : profile.name}</span>
+                    <Markdown text={line.text} />
+                  </div>
                 ))}
               </div>
             </>
@@ -489,15 +511,23 @@ function AskCard({ ask, onClose }: { ask: Ask; onClose: () => void }) {
 }
 
 function Caption({ text, fallback, live }: { text: string; fallback: string; live: boolean }) {
-  if (!text) return <p className="caption quiet">{fallback}</p>
-  const pieces = text.split(/(?<=[。！？])/)
-  const tail = pieces.pop() ?? ''
+  const viewport = useRef<HTMLDivElement>(null)
+  const follow = useRef(true)
+
+  useEffect(() => {
+    if (follow.current && viewport.current) viewport.current.scrollTop = viewport.current.scrollHeight
+  }, [text, fallback])
 
   return (
-    <p className="caption">
-      {pieces.join('')}
-      <span className={live ? 'clause' : undefined}>{tail}</span>
-    </p>
+    <div className={`caption caption-scroll${text ? '' : ' quiet'}`} ref={viewport}
+      tabIndex={0} role="region" aria-label="对话字幕" aria-live={live ? 'off' : 'polite'}
+      onPointerDown={event => event.stopPropagation()} onPointerUp={event => event.stopPropagation()}
+      onScroll={event => {
+        const element = event.currentTarget
+        follow.current = element.scrollHeight - element.scrollTop - element.clientHeight < 32
+      }}>
+      <Markdown text={text || fallback} />
+    </div>
   )
 }
 
@@ -505,21 +535,47 @@ function play(
   url: string,
   ticket: number,
   generation: { current: number },
-  slot: { current: HTMLAudioElement | null }
+  slot: { current: HTMLAudioElement | null },
+  onPlaying: () => void,
+  onLevel: (level: number) => void
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const audio = new Audio(url)
+    let stopMeter = () => {}
+    const finish = () => {
+      stopMeter()
+      resolve()
+    }
 
     slot.current = audio
-    audio.onended = () => resolve()
-    audio.onpause = () => resolve()
-    audio.onerror = () => reject(new Error('播放失败'))
+    audio.onplaying = () => {
+      if (generation.current !== ticket) {
+        audio.pause()
+        return
+      }
+      onPlaying()
+      try {
+        stopMeter()
+        stopMeter = measurePlayback(audio, onLevel)
+      } catch {
+        onLevel(0)
+      }
+    }
+    audio.onended = finish
+    audio.onpause = finish
+    audio.onerror = () => {
+      stopMeter()
+      reject(new Error('播放失败'))
+    }
     void audio.play().then(() => {
       if (generation.current !== ticket) {
         audio.pause()
         resolve()
       }
-    }).catch(reject)
+    }).catch(error => {
+      stopMeter()
+      reject(error)
+    })
   })
 }
 

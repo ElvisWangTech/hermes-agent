@@ -102,9 +102,8 @@ export async function listSessions(client: JsonRpcGatewayClient): Promise<PastSe
   const result = await client.request<{ sessions: ListedSession[] }>('session.list', { limit: 40 })
   const rows = result.sessions ?? []
   const pocket = rows.filter(row => row.source === 'pocket')
-  const shown = pocket.length > 0 ? pocket : rows
 
-  return shown.map(row => ({
+  return pocket.map(row => ({
     id: row.id,
     title: row.title || '对话',
     preview: row.preview || '',

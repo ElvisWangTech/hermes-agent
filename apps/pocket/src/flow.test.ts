@@ -1,6 +1,25 @@
 import { describe, expect, it } from 'vitest'
 import { ageFace, characters } from './characters'
 import { cleanName, memoryLine, stepFor, takeSentences } from './flow'
+import { audioLevel } from './audio'
+import { listSessions } from './api'
+import type { JsonRpcGatewayClient } from '@hermes/shared'
+
+describe('listSessions', () => {
+  it('never substitutes non-Pocket history when Pocket history is empty', async () => {
+    const client = { request: async () => ({ sessions: [{ id: 'cli-session', source: 'cli' }] }) }
+    expect(await listSessions(client as unknown as JsonRpcGatewayClient)).toEqual([])
+  })
+})
+
+describe('audioLevel', () => {
+  it('measures silence and actual sample energy without inventing motion', () => {
+    expect(audioLevel(new Uint8Array())).toBe(0)
+    expect(audioLevel(new Uint8Array([128, 128]))).toBe(0)
+    expect(audioLevel(new Uint8Array([140, 116]))).toBeGreaterThan(0)
+    expect(audioLevel(new Uint8Array([255, 0]))).toBe(1)
+  })
+})
 
 describe('stepFor', () => {
   it('walks connect, then a character, then a name', () => {

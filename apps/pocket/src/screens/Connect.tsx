@@ -12,6 +12,10 @@ export function Connect({ onToken }: ConnectProps) {
     const token = code.trim()
 
     if (!token) return
+    if (!navigator.mediaDevices?.getUserMedia) {
+      onToken(token)
+      return
+    }
     void navigator.mediaDevices
       ?.getUserMedia({ audio: true })
       .then(stream => {
