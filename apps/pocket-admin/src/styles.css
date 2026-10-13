@@ -1,0 +1,49 @@
+.pa-login { min-height: 100dvh; display: grid; place-items: center; padding: 24px; }
+.pa-login form { width: min(360px, 100%); }
+.pa-login h1 { font-size: 24px; }
+.pa-login label { display: grid; gap: 8px; margin-bottom: 20px; }
+:root { font-family: "PingFang SC", "Noto Sans SC", sans-serif; color: #26302e; background: #f6f8f7; font-size: 14px; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+button, input, select { font: inherit; }
+button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; padding: 0 14px; background: white; border: 1px solid #dce3df; border-radius: 6px; color: inherit; cursor: pointer; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+button:hover:not(:disabled) { background: #edf3f0; }
+input, select { min-height: 44px; border: 1px solid #cfd9d3; border-radius: 6px; padding: 10px; background: white; color: inherit; max-width: 100%; }
+input { width: min(100%, 480px); }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid #168879; outline-offset: 3px; }
+.pa-shell { display: grid; grid-template-columns: 184px minmax(0,1fr); min-height: 100vh; }
+aside { padding: 26px 16px; background: white; border-right: 1px solid #e1e7e3; }
+aside strong { font-size: 19px; }
+nav { display: grid; gap: 6px; margin: 30px 0; }
+nav button { justify-content: flex-start; border: 0; }
+nav .current { background: #e4efea; color: #126b56; }
+small { color: #6b7872; display: block; overflow-wrap: anywhere; font-size: 12px; }
+header { height: 66px; background: white; border-bottom: 1px solid #e1e7e3; padding: 0 32px; display: flex; justify-content: space-between; align-items: center; }
+main { max-width: 1260px; padding: 32px; margin: auto; }
+h1 { font-size: 25px; margin: 0; overflow-wrap: anywhere; }
+h2 { font-size: 17px; margin-top: 30px; }
+p { color: #68766f; line-height: 1.7; overflow-wrap: anywhere; }
+.pa-heading { display: flex; gap: 16px; justify-content: space-between; align-items: center; }
+.pa-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.pa-list { margin-top: 20px; border-top: 1px solid #dce3df; }
+.pa-role, .pa-row { width: 100%; display: grid; grid-template-columns: minmax(0,1fr) 130px 130px; align-items: center; gap: 20px; padding: 18px 0; border: 0; border-bottom: 1px solid #e1e7e3; border-radius: 0; background: transparent; text-align: left; }
+.pa-role { grid-template-columns: 48px minmax(0,1fr) 110px 130px; }
+.pa-role img { width: 48px; height: 48px; object-fit: contain; background: #e8efec; border-radius: 6px; }
+.pa-row strong, .pa-role strong { overflow-wrap: anywhere; }
+.pa-good { color: #16765d; }.pa-bad, .pa-danger { color: #ae3636; }
+.pa-notice { min-height: 28px; color: #16765d; }
+.pa-error { color: #a72c2c; padding: 12px; background: #fff0ef; display: flex; gap: 16px; align-items: center; }
+.pa-empty { padding: 36px 0; }
+.pa-primary { background: #176b55; color: white; margin: 12px 0 0 8px; }
+.pa-modal::backdrop { background: #15291d66; }
+.pa-modal { position: fixed; inset: 0; margin: auto; width: min(520px, calc(100% - 32px)); max-height: calc(100dvh - 32px); overflow-y: auto; border: 1px solid #dce3df; border-radius: 8px; padding: 24px; z-index: 11; box-shadow: 0 18px 70px #14251b33; }
+.pa-dialog-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }.pa-dialog-header h2 { margin: 0; }
+label { display: grid; gap: 8px; margin: 20px 0; }label input { width: 100%; }
+.pa-secret { display: block; font-family: monospace; font-size: 20px; padding: 18px; background: #edf3f0; overflow-wrap: anywhere; margin: 24px 0; }.pa-id { overflow-wrap: anywhere; }
+.pa-config { max-width: 720px; }
+.pa-config fieldset { min-width: 0; margin: 28px 0 0; padding: 16px 0; border: 0; border-top: 1px solid #dce3df; }
+.pa-config legend { padding: 0 12px 0 0; font-weight: 600; }
+.pa-toggle { display: flex; align-items: center; }
+.pa-toggle input { width: 18px; min-height: 18px; }
+@media (max-width: 760px) { .pa-shell { grid-template-columns: 1fr; } aside { padding: 16px; border-right: 0; border-bottom: 1px solid #e1e7e3; } nav { display: flex; margin: 12px 0 0; } aside>small { display: none; } header { padding: 0 16px; height: 52px; } main { padding: 24px 16px; } .pa-heading { align-items: flex-start; flex-direction: column; } .pa-role { grid-template-columns: 42px minmax(0,1fr); gap: 12px; }.pa-role>span:nth-last-child(-n+2) { grid-column: 2; }.pa-row { grid-template-columns: minmax(0,1fr) 80px; gap: 12px; }.pa-row button { grid-column: 2; }.pa-modal { padding: 20px; } }

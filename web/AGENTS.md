@@ -37,7 +37,7 @@ desktop has no build/runtime dependency on this frontend. Details: `apps/desktop
 
 ## Rules
 
-- Auth: every new REST route and WS endpoint uses the same session token; never a second scheme.
+- Auth: use the unified Web authentication boundary. Service/session credentials retain administrator authority; Pocket device credentials bind one profile and a narrow capability set. Never accept device credentials at management endpoints or introduce a route-local authentication bypass. Connection-code exchange is the sole unauthenticated Pocket bootstrap.
 - Routers are one-file-per-surface; a new surface is a new `web_routers/<surface>.py`, not a growing
   `web_server.py`.
 - Tests: Python in `tests/hermes_cli/` (routers, pty bridge); JS in the `web/` vitest suite. Python

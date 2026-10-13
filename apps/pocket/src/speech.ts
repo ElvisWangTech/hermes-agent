@@ -1,3 +1,19 @@
+export const voiceInstruction = '\n\n[POCKET_VOICE_REQUEST]\n请先正常完整回答，再在回复末尾使用 <pocket-voice-summary> 和 </pocket-voice-summary> 包住口语摘要。摘要使用回复原语言，2到4个短句，中文不超过180字；保留主要结论、关键数字、提醒和下一步。表格只概括结论和比较，不逐行朗读；不要朗读代码、网址或Markdown标记，不添加原文没有的事实。\n[/POCKET_VOICE_REQUEST]'
+
+export function voiceReply(text: string): { text: string; summary: string } {
+  const start = text.indexOf('<pocket-voice-summary>')
+  if (start < 0) return { text: text.trim(), summary: '' }
+  const end = text.indexOf('</pocket-voice-summary>', start)
+  return {
+    text: text.slice(0, start).trim(),
+    summary: end < 0 ? '' : text.slice(start + '<pocket-voice-summary>'.length, end).trim()
+  }
+}
+
+export function visibleUserText(text: string): string {
+  return text.endsWith(voiceInstruction) ? text.slice(0, -voiceInstruction.length) : text
+}
+
 import { unified } from 'unified'
 import remarkParse from 'remark-parse'
 import remarkGfm from 'remark-gfm'

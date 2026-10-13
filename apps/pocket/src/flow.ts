@@ -1,4 +1,5 @@
 export interface PocketProfile {
+  localId?: string
   token: string
   characterId: string
   name: string

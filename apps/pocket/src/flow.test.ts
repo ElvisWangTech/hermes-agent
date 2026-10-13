@@ -1,14 +1,26 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ageFace, characters } from './characters'
 import { cleanName, memoryLine, stepFor, takeSentences } from './flow'
 import { audioLevel } from './audio'
-import { listSessions } from './api'
+import { exchangeCode, listSessions } from './api'
 import type { JsonRpcGatewayClient } from '@hermes/shared'
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 describe('listSessions', () => {
   it('never substitutes non-Pocket history when Pocket history is empty', async () => {
     const client = { request: async () => ({ sessions: [{ id: 'cli-session', source: 'cli' }] }) }
     expect(await listSessions(client as unknown as JsonRpcGatewayClient)).toEqual([])
+  })
+})
+
+describe('exchangeCode', () => {
+  it('reports a useful error when the backend returns a non-JSON response', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', { status: 502 })))
+
+    await expect(exchangeCode('test-code')).rejects.toThrow('连接服务没有返回有效响应')
   })
 })
 

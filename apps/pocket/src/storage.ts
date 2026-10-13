@@ -7,11 +7,8 @@ const empty: PocketProfile = { token: '', characterId: '', name: '' }
 export function adoptToken(profile: PocketProfile): PocketProfile {
   const params = new URLSearchParams(window.location.search)
   const fromUrl = params.get('token')?.trim() ?? ''
-  const injected = (window.__POCKET_SESSION_TOKEN__ ?? '').trim()
-  // A loopback Hermes server creates a fresh token on every restart. Prefer the
-  // current page/bootstrap token so a stale localStorage token cannot trigger
-  // an avoidable reconnect prompt or WebSocket 403.
-  const token = fromUrl || injected || profile.token
+  const candidate = fromUrl || profile.token
+  const token = candidate.startsWith('pd_') ? candidate : ''
 
   if (fromUrl) {
     params.delete('token')
@@ -35,6 +32,7 @@ export function loadProfile(): PocketProfile {
     const parsed = JSON.parse(raw) as Partial<PocketProfile>
 
     return {
+      localId: typeof parsed.localId === 'string' ? parsed.localId : undefined,
       token: typeof parsed.token === 'string' ? parsed.token : '',
       characterId: typeof parsed.characterId === 'string' ? parsed.characterId : '',
       name: typeof parsed.name === 'string' ? parsed.name : ''
@@ -46,6 +44,34 @@ export function loadProfile(): PocketProfile {
 
 export function saveProfile(profile: PocketProfile): void {
   localStorage.setItem(KEY, JSON.stringify(profile))
+  if (profile.localId) {
+    const roles = savedRoles().filter(role => role.localId !== profile.localId)
+    localStorage.setItem('pocket.roles', JSON.stringify([...roles, profile]))
+  }
+}
+
+export function savedRoles(): PocketProfile[] {
+  try {
+    const roles: unknown = JSON.parse(localStorage.getItem('pocket.roles') || '[]')
+    return Array.isArray(roles) ? roles.filter((role): role is PocketProfile =>
+      !!role && typeof role.localId === 'string' && typeof role.token === 'string' &&
+      typeof role.characterId === 'string' && typeof role.name === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+export function switchRole(next: PocketProfile): void {
+  const previous = loadProfile()
+  const session = storedSession()
+  if (previous.localId) {
+    if (session) localStorage.setItem(`pocket.session.${previous.localId}`, session)
+    else localStorage.removeItem(`pocket.session.${previous.localId}`)
+  }
+  const restored = next.localId ? localStorage.getItem(`pocket.session.${next.localId}`) : null
+  localStorage.removeItem('pocket.session')
+  if (restored) rememberSession(restored)
+  saveProfile(next)
 }
 
 export function voiceEnabled(): boolean {
@@ -66,6 +92,11 @@ export function rememberSession(id: string): void {
 
 
 export function clearPocketStorage(): void {
+  const current = loadProfile()
+  if (current.localId) {
+    localStorage.setItem('pocket.roles', JSON.stringify(savedRoles().filter(role => role.localId !== current.localId)))
+    localStorage.removeItem(`pocket.session.${current.localId}`)
+  }
   localStorage.removeItem(KEY)
   localStorage.removeItem('pocket.session')
   localStorage.removeItem('pocket.voice')

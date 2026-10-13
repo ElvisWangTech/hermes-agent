@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { exchangeCode } from '../api'
 
 interface ConnectProps {
   onToken: (token: string) => void
@@ -7,11 +8,19 @@ interface ConnectProps {
 export function Connect({ onToken }: ConnectProps) {
   const [code, setCode] = useState('')
   const [note, setNote] = useState('')
+  const [busy, setBusy] = useState(false)
 
-  const go = () => {
-    const token = code.trim()
-
-    if (!token) return
+  const go = async () => {
+    if (!code.trim() || busy) return
+    setBusy(true)
+    let token: string
+    try {
+      token = await exchangeCode(code.trim())
+    } catch (error) {
+      setNote(error instanceof Error ? error.message : '连接失败')
+      setBusy(false)
+      return
+    }
     if (!navigator.mediaDevices?.getUserMedia) {
       onToken(token)
       return
@@ -35,7 +44,7 @@ export function Connect({ onToken }: ConnectProps) {
         连接码
         <input value={code} autoComplete="off" onChange={event => setCode(event.target.value)} />
       </label>
-      <button type="button" className="primary" onClick={go} disabled={!code.trim()}>
+      <button type="button" className="primary" onClick={() => void go()} disabled={busy || !code.trim()}>
         继续
       </button>
       {note ? <p className="note">{note}</p> : null}

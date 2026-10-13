@@ -724,6 +724,10 @@ async def _token_auth_seam(request: Request, call_next):
     routes pass through untouched.
     """
     from hermes_cli.dashboard_auth.token_auth import token_auth_middleware
+    from hermes_cli.dashboard_auth.pocket_access import admit_http
+    response = await admit_http(request, call_next)
+    if response is not None:
+        return response
     return await token_auth_middleware(request, call_next)
 
 

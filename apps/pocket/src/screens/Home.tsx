@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import type { ServerRequest } from '@hermes/shared'
+import { Mic, MicOff } from 'lucide-react'
 import {
   ensureSession,
   interruptSession,
@@ -14,17 +15,19 @@ import {
   type TurnLine
 } from '../api'
 import { findCharacter, type Mood } from '../characters'
-import { takeSentences, type PocketProfile } from '../flow'
+import { type PocketProfile } from '../flow'
+import { speechText, voiceReply } from '../speech'
 import { openEar, type Ear } from '../listen'
 import { measurePlayback } from '../audio'
 import { Portrait } from '../Portrait'
 import { Markdown } from '../Markdown'
 import { Waveform } from '../Waveform'
-import { speechText } from '../speech'
+import { ClarifyCard } from '../ClarifyCard'
 import { rememberSession, setVoiceEnabled, storedSession, voiceEnabled } from '../storage'
 
 interface HomeProps {
   profile: PocketProfile
+  onSwitch: () => void
   onReset: () => void
   onDestroy: () => Promise<void>
 }
@@ -41,7 +44,7 @@ interface Ask {
 
 const valueMethods = new Set(['sudo', 'secret', 'vault.code', 'display.install.sudo', 'vault.unlock_prompt'])
 
-export function Home({ profile, onReset, onDestroy }: HomeProps) {
+export function Home({ profile, onReset, onDestroy, onSwitch }: HomeProps) {
   const character = findCharacter(profile.characterId)
   const [mood, setMood] = useState<Mood>('idle')
   const [muted, setMuted] = useState(!voiceEnabled())
@@ -53,6 +56,7 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
   const [past, setPast] = useState<PastSession[] | null>(null)
   const [reading, setReading] = useState<{ title: string; lines: TurnLine[] } | null>(null)
   const [ask, setAsk] = useState<Ask | null>(null)
+  const [clarify, setClarify] = useState<ServerRequest | null>(null)
   const [voiceNote, setVoiceNote] = useState('')
   const [inputLevel, setInputLevel] = useState(0)
   const [outputLevel, setOutputLevel] = useState(0)
@@ -150,7 +154,7 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
       if (sessionId.current) await interruptSession(clientRef.current!, sessionId.current)
       if (ticket !== generation.current) return
       busyRef.current = true
-      await submitText(clientRef.current!, sessionId.current, clean)
+      await submitText(clientRef.current!, sessionId.current, clean, !mutedRef.current)
     } catch {
       if (ticket !== generation.current) return
       busyRef.current = false
@@ -194,17 +198,8 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
       }
 
       if (request.method === 'clarify') {
-        const params = request.params as { question?: string | null }
-
-        setAsk({
-          title: params.question || '她想确认一件事',
-          body: '',
-          needsText: true,
-          allow: '告诉她',
-          deny: '不用',
-          onAllow: text => request.respond({ answer: text }),
-          onDeny: () => request.respond({ answer: '' })
-        })
+        setClarify(request)
+        setMood('wait')
 
         return true
       }
@@ -247,20 +242,20 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
           onDelta: chunk => {
             if (!busyRef.current) return
             pending.current += chunk
-            setCaption(pending.current)
+            setCaption(voiceReply(pending.current).text)
           },
           onTool: () => { if (busyRef.current) setMood('think') },
           onComplete: text => {
             if (!busyRef.current) return
             busyRef.current = false
-            const full = (text || pending.current).trim()
+            const reply = voiceReply(text || pending.current)
+            const full = reply.text
 
             pending.current = ''
             if (full) setTurns(current => [...current, { role: 'assistant', text: full }])
             setCaption(full)
-            const spoken = takeSentences(speechText(full))
-            spoken.ready.forEach(enqueue)
-            if (spoken.rest) enqueue(spoken.rest)
+            if (reply.summary) enqueue(speechText(reply.summary))
+            else if (!mutedRef.current && full) setVoiceNote('这次回复没有语音摘要')
             if (!queue.current.length && !speaking.current) setMood(mutedRef.current ? 'wait' : 'idle')
           }
         })
@@ -362,11 +357,11 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
         className="ghost destroy-entry"
         onPointerDown={event => event.stopPropagation()}
         onClick={() => {
-          if (!window.confirm('清除名字记忆和本地缓存？历史对话、主人资料和角色数据不会删除。')) return
-          void onDestroy().catch(() => setVoiceNote('名字还没有清除，请稍后再试'))
+          if (!window.confirm('断开此设备并清除本地缓存？角色、记忆、历史对话和其他设备不受影响。')) return
+          void onDestroy().catch(() => setVoiceNote('设备还没有断开，请稍后再试'))
         }}
       >
-        清除名字
+        断开此设备
       </button>
       <button
         type="button"
@@ -399,8 +394,10 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
           </button>
         ) : null}
         <p className="hint">上滑看对话</p>
-        <button type="button" className={muted ? 'mic off' : 'mic'} onPointerDown={event => event.stopPropagation()} onClick={toggleMute}>
-          {muted ? '听不见' : '在听'}
+        <button type="button" className={muted ? 'mic off' : 'mic'}
+          aria-label={muted ? '开启麦克风' : '关闭麦克风'} title={muted ? '开启麦克风' : '关闭麦克风'}
+          onPointerDown={event => event.stopPropagation()} onClick={toggleMute}>
+          {muted ? <MicOff size={28} aria-hidden="true" /> : <Mic size={28} aria-hidden="true" />}
         </button>
       </section>
       {sheet ? (
@@ -408,6 +405,7 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
           <button type="button" className="back" onClick={() => setSheet(false)}>
             返回
           </button>
+          <button type="button" onClick={onSwitch}>切换角色</button>
           <div className="log">
             {turns.map((turn, index) => (
               <div className="message" key={`${turn.role}-${index}`}>
@@ -473,6 +471,7 @@ export function Home({ profile, onReset, onDestroy }: HomeProps) {
         </section>
       ) : null}
       {ask ? <AskCard ask={ask} onClose={() => setAsk(null)} /> : null}
+      {clarify ? <ClarifyCard key={clarify.id} request={clarify} onClose={() => setClarify(null)} /> : null}
     </main>
   )
 }

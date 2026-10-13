@@ -231,6 +231,14 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     rejected in gated mode: a leaked ``_SESSION_TOKEN`` must not grant access.
     """
     from hermes_cli.web_server import _SESSION_TOKEN, app
+    token = ws.query_params.get("token", "")
+    if token.startswith("pd_"):
+        from hermes_cli.dashboard_auth.pocket_access import authority
+        identity = authority().verify(token)
+        if identity is None or ws.url.path != "/api/ws":
+            return "device_denied", "device"
+        ws._hermes_auth_identity = {**identity, "provider": "pocket", "credential": token}
+        return None, "device"
     auth_required = bool(getattr(app.state, "auth_required", False))
     if auth_required:
         # Lazy import — keeps this function importable in test harnesses

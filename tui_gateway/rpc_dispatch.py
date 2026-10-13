@@ -50,6 +50,12 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     t = transport or _stdio_transport
     token = bind_transport(t)
     try:
+        from hermes_cli.dashboard_auth.pocket_access import admit_rpc
+        from tui_gateway import server
+        try:
+            req = admit_rpc(req, t, server)
+        except PermissionError as exc:
+            return _err(req.get("id") if isinstance(req, dict) else None, 4030, str(exc))
         from tui_gateway import server_requests
         if server_requests.is_response_frame(req):
             # The renderer answering one of OUR requests (clarify, approval, …): no response frame goes back.

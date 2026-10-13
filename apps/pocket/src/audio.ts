@@ -24,11 +24,14 @@ export function measurePlayback(audio: HTMLAudioElement, onLevel: (level: number
   }
   void context.resume().catch(() => undefined)
   tick()
+  let stopped = false
   return () => {
+    if (stopped) return
+    stopped = true
     window.clearTimeout(timer)
     onLevel(0)
     source.disconnect()
     analyser.disconnect()
-    void context.close()
+    if (context.state !== 'closed') void context.close()
   }
 }

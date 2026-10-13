@@ -200,6 +200,9 @@ class WSTransport:
             for line in lines:
                 if self._closed:
                     return
+                from hermes_cli.dashboard_auth.pocket_access import admit_output
+                if (self.auth_identity or {}).get("provider") == "pocket" and not await asyncio.to_thread(admit_output, json.loads(line), self):
+                    continue
                 payload = _sanitize_ws_text(line)
                 try:
                     await asyncio.wait_for(self._ws.send_text(payload), timeout=_WS_SEND_DEADLINE_S)

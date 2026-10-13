@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from hermes_cli.web_routers._common import config_scoped_to_thread, destructive_profile
@@ -21,6 +21,41 @@ _MAX_NAME = 24
 
 class PocketNameBody(BaseModel):
     name: str
+
+
+class PocketCodeBody(BaseModel):
+    code: str
+
+
+@router.post("/api/pocket/exchange")
+async def exchange_pocket_code(body: PocketCodeBody):
+    from hermes_cli.dashboard_auth.pocket_access import authority
+
+    if len(body.code) > 128:
+        raise HTTPException(status_code=400, detail="Invalid connection code")
+    try:
+        return authority().exchange(body.code)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+
+@router.get("/api/pocket/identity")
+async def pocket_identity(request: Request):
+    identity = getattr(request.state, "pocket_identity", None)
+    if identity is None:
+        raise HTTPException(status_code=403, detail="Device credential required")
+    return {key: identity[key] for key in ("profile_id", "device_id")}
+
+
+@router.delete("/api/pocket/device")
+async def disconnect_pocket_device(request: Request):
+    from hermes_cli.dashboard_auth.pocket_access import authority
+
+    identity = getattr(request.state, "pocket_identity", None)
+    if identity is None:
+        raise HTTPException(status_code=403, detail="Device credential required")
+    authority().revoke_device(identity["device_id"], identity["profile_id"])
+    return {"ok": True}
 
 
 def name_memory_line(name: str) -> str:

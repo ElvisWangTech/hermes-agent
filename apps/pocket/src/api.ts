@@ -1,3 +1,4 @@
+import { voiceInstruction, voiceReply, visibleUserText } from './speech'
 import { buildHermesWebSocketUrl, JsonRpcGatewayClient, type ServerRequest } from '@hermes/shared'
 
 interface ListedSession {
@@ -29,6 +30,22 @@ function authHeaders(token: string): HeadersInit {
   return { 'X-Hermes-Session-Token': token, 'Content-Type': 'application/json' }
 }
 
+export async function exchangeCode(code: string): Promise<string> {
+  const response = await fetch('/api/pocket/exchange', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code })
+  })
+  let body: { token?: string; detail?: string }
+  try {
+    body = await response.json() as { token?: string; detail?: string }
+  } catch {
+    throw new Error('连接服务没有返回有效响应，请确认 Hermes 后端正在运行后重试')
+  }
+  if (!response.ok || !body.token?.startsWith('pd_')) throw new Error(body.detail || '连接码没有兑换成功')
+  return body.token
+}
+
 export async function openGateway(token: string, onRequest: (request: ServerRequest) => void): Promise<JsonRpcGatewayClient> {
   const client = new JsonRpcGatewayClient()
 
@@ -38,16 +55,15 @@ export async function openGateway(token: string, onRequest: (request: ServerRequ
   return client
 }
 
-export async function destroyRole(token: string, name: string): Promise<void> {
-  const response = await fetch('/api/pocket/role', {
+export async function disconnectDevice(token: string): Promise<void> {
+  const response = await fetch('/api/pocket/device', {
     method: 'DELETE',
-    headers: authHeaders(token),
-    body: JSON.stringify({ name })
+    headers: authHeaders(token)
   })
 
   if (!response.ok) {
     const body = (await response.json().catch(() => ({}))) as { detail?: string }
-    throw new Error(body.detail || '角色没有销毁')
+    throw new Error(body.detail || '设备没有断开')
   }
 }
 
@@ -90,8 +106,8 @@ export async function ensureSession(client: JsonRpcGatewayClient, storedId: stri
   return created.session_id
 }
 
-export async function submitText(client: JsonRpcGatewayClient, sessionId: string, text: string): Promise<void> {
-  await client.request('prompt.submit', { session_id: sessionId, text })
+export async function submitText(client: JsonRpcGatewayClient, sessionId: string, text: string, voice = false): Promise<void> {
+  await client.request('prompt.submit', { session_id: sessionId, text: voice ? text + voiceInstruction : text })
 }
 
 export async function interruptSession(client: JsonRpcGatewayClient, sessionId: string): Promise<void> {
@@ -124,7 +140,8 @@ export async function readSession(client: JsonRpcGatewayClient, storedId: string
     if (message.role !== 'user' && message.role !== 'assistant') continue
     const text = typeof message.text === 'string' ? message.text : ''
 
-    if (text.trim()) lines.push({ role: message.role, text: text.trim() })
+    const visible = message.role === 'assistant' ? voiceReply(text).text : visibleUserText(text).trim()
+    if (visible) lines.push({ role: message.role, text: visible })
   }
 
   return lines

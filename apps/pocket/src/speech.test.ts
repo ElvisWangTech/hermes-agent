@@ -1,5 +1,18 @@
 import { expect, it } from 'vitest'
-import { speechText } from './speech'
+import { speechText, voiceInstruction, voiceReply, visibleUserText } from './speech'
+
+it('separates the complete response from its spoken summary', () => {
+  const body = '|城市|温度|\n|---|---|\n|北京|23|'
+  expect(voiceReply(`${body}\n<pocket-voice-summary>北京二十三度。</pocket-voice-summary>`))
+    .toEqual({ text: body, summary: '北京二十三度。' })
+  expect(voiceReply(body)).toEqual({ text: body, summary: '' })
+  expect(voiceReply(`${body}\n<pocket-voice-summary>未完成`)).toEqual({ text: body, summary: '' })
+})
+
+it('hides only the appended voice instruction in user history', () => {
+  expect(visibleUserText('天气如何？' + voiceInstruction)).toBe('天气如何？')
+  expect(visibleUserText('普通问题')).toBe('普通问题')
+})
 
 it('reads Markdown prose and table cells without formatting syntax or URLs', () => {
   const text = speechText('# 天气\n\n**今天**看[预报](https://example.com)。\n\n- *多云*\n\n|日期|气温|\n|---|---|\n|今天|23度|')

@@ -1,3 +1,12 @@
+.role-choice { display: flex; align-items: center; gap: 12px; text-align: left; flex-shrink: 0; }
+.role-choice img { object-fit: contain; }
+.clarify-card { touch-action: pan-y; }
+.clarify-questions { flex: 1; min-height: 0; overflow-y: auto; }
+.clarify-questions fieldset { min-width: 0; margin: 0 0 20px; padding: 12px; border: 1px solid #695346; }
+.clarify-questions legend { max-width: 100%; font-size: 1rem; }
+.clarify-choice { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
+.clarify-choice input { width: 18px; height: 18px; flex: 0 0 auto; }
+.clarify-questions textarea { width: 100%; resize: vertical; font: inherit; color: inherit; background: #2a211c; border: 1px solid #695346; padding: 10px; border-radius: 6px; }
 :root {
   color: #f6e7d4;
   background: #1a1410;
@@ -258,6 +267,9 @@ h1 { font-size: clamp(1.35rem, 4vw, 1.7rem); font-weight: 500; margin: 0; }
 .past-entry { position: absolute; top: calc(12px + env(safe-area-inset-top)); left: 12px; z-index: 2; }
 
 .mic {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 72px;
   height: 72px;
   border-radius: 50%;
