@@ -15,6 +15,8 @@ import {
   type TurnLine
 } from '../api'
 import { findCharacter, type Mood } from '../characters'
+import type { FigureHandle } from '../live2d/Stage'
+import { heardLevel, lookAt, type LookPoint } from '../live2d/pose'
 import { type PocketProfile } from '../flow'
 import { speechText, voiceReply } from '../speech'
 import { openEar, type Ear } from '../listen'
@@ -73,6 +75,8 @@ export function Home({ profile, onReset, onDestroy, onSwitch }: HomeProps) {
   const origin = useRef({ x: 0, y: 0 })
   const mutedRef = useRef(muted)
   const busyRef = useRef(false)
+  const figureRef = useRef<FigureHandle>(null)
+  const look = useRef<LookPoint>({ x: 0, y: 0 })
 
   mutedRef.current = muted
 
@@ -343,15 +347,34 @@ export function Home({ profile, onReset, onDestroy, onSwitch }: HomeProps) {
       return
     }
 
+    const onStage = event.target instanceof Element && event.target.closest('.stage')
+
     if (Math.abs(dx) < 16 && Math.abs(dy) < 16) {
-      if (speaking.current || busyRef.current) {
-        interruptReply()
-      }
+      if (speaking.current || busyRef.current) interruptReply()
+      else if (onStage) figureRef.current?.nod()
     }
+
+    look.current = { x: 0, y: 0 }
+  }
+
+  const onPointerMove = (event: ReactPointerEvent) => {
+    const stage = event.target instanceof Element ? event.target.closest('.stage') : null
+
+    if (!stage) return
+    look.current = lookAt(event.clientX, event.clientY, stage.getBoundingClientRect())
   }
 
   return (
-    <main className="home" onPointerDown={onPointerDown} onPointerUp={onPointerUp} onContextMenu={event => event.preventDefault()}>
+    <main
+      className="home"
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerLeave={() => {
+        look.current = { x: 0, y: 0 }
+      }}
+      onContextMenu={event => event.preventDefault()}
+    >
       <button
         type="button"
         className="ghost destroy-entry"
@@ -377,10 +400,15 @@ export function Home({ profile, onReset, onDestroy, onSwitch }: HomeProps) {
       >
         以前
       </button>
-      <Portrait character={character} />
+      <Portrait
+        character={character}
+        figure={figureRef}
+        look={look.current}
+        input={{ mood, muted, confirming: Boolean(ask || clarify), inputLevel, outputLevel }}
+      />
       <section className="lower">
         <p className="who">{profile.name}</p>
-        <p className="note" role="status">{status || (ask ? '等你确认' : mood === 'speak' ? '正在说话' : mood === 'think' ? '正在思考' : inputLevel > 0.16 ? '正在听' : muted ? '麦克风已关闭' : voiceNote ? '文字回复' : '等你开口')}</p>
+        <p className="note" role="status">{status || (ask ? '等你确认' : mood === 'speak' ? '正在说话' : mood === 'think' ? '正在思考' : inputLevel > heardLevel ? '正在听' : muted ? '麦克风已关闭' : voiceNote ? '文字回复' : '等你开口')}</p>
         <div className="audio-levels">
           <Waveform label="你" level={inputLevel} />
           <Waveform label={profile.name} level={outputLevel} />

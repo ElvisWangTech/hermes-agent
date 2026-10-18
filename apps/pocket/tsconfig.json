@@ -15,7 +15,10 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
-    "types": ["vite/client"]
+    "types": ["vite/client"],
+    "paths": {
+      "@framework/*": ["./vendor/cubism/Framework/src/*"]
+    }
   },
   "include": ["src"]
 }

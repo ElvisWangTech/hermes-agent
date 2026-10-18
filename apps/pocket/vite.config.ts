@@ -1,3 +1,4 @@
+import path from 'node:path'
 import react from '@vitejs/plugin-react'
 import type { Plugin } from 'vite'
 import { defineConfig } from 'vite'
@@ -40,6 +41,11 @@ function devSessionToken(): Plugin {
 export default defineConfig({
   base: '/pocket/',
   plugins: [react(), devSessionToken()],
+  resolve: {
+    alias: {
+      '@framework': path.resolve(import.meta.dirname, 'vendor/cubism/Framework/src')
+    }
+  },
   server: {
     port: 5176,
     proxy: {

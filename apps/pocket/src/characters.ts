@@ -5,6 +5,7 @@ export interface Character {
   id: string
   band: BandId
   image: string
+  model?: string
 }
 
 export interface Band {
@@ -14,8 +15,8 @@ export interface Band {
 
 const base = `${import.meta.env.BASE_URL}characters/`
 
-function portrait(id: string, band: BandId, file: string): Character {
-  return { id, band, image: `${base}${file}` }
+function portrait(id: string, band: BandId, file: string, model?: string): Character {
+  return { id, band, image: `${base}${file}`, model: model ? `${base}${model}` : undefined }
 }
 
 export const bands: Band[] = [
@@ -31,7 +32,7 @@ export const characters: Character[] = [
   portrait('teen-0', 'teen', 'teen-0.png'),
   portrait('teen-1', 'teen', 'teen-1.png'),
   portrait('teen-2', 'teen', 'teen-2.png'),
-  portrait('adult-0', 'adult', 'adult-0.png'),
+  portrait('adult-0', 'adult', 'adult-0.png', 'adult-0/adult-0.model3.json'),
   portrait('adult-1', 'adult', 'adult-1.png'),
   portrait('adult-2', 'adult', 'adult-2.png')
 ]
