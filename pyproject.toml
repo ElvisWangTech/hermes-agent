@@ -236,8 +236,10 @@ ddgs = ["ddgs==9.16.0"]
 # Image generation backends
 fal = ["fal-client==0.13.1"]
 # Edge TTS — default TTS provider but still optional (users can pick
-# ElevenLabs / OpenAI / MiniMax instead).
-edge-tts = ["edge-tts==7.2.7"]
+# ElevenLabs / OpenAI / MiniMax instead). 7.3.1 is the first release that
+# sends Sec-MS-GEC v2 tokens; Microsoft started rejecting the v1 handshake
+# (403 on the read-aloud websocket) in October 2026.
+edge-tts = ["edge-tts==7.3.1"]
 # NeuTTS's upstream Python ceiling excludes the managed interpreter.
 # Keep dependency markers and PM gates together: bundles omit them, explicit
 # setup requests report unavailable rather than succeeding with an empty set.
