@@ -80,6 +80,27 @@ class TestOneShotGraceDueScan:
         # Still stored (dispatch proceeds normally).
         assert [j["id"] for j in load_jobs()] == ["recent"]
 
+    def test_stale_pocket_reminder_kept_and_delivered(self, cron_store, monkeypatch):
+        delivered = []
+        monkeypatch.setattr(
+            "cron.jobs._deliver_late_pocket_reminder",
+            lambda job: delivered.append(job["id"]),
+        )
+        stale = _oneshot("late-water", FIXED_NOW - timedelta(hours=3))
+        stale["deliver"] = "pocket"
+        stale["origin"] = {
+            "platform": "pocket",
+            "pocket_kind": "remind",
+            "pocket_phrase": "喝水",
+        }
+        save_jobs([stale])
+
+        due = get_due_jobs()
+
+        assert [d["id"] for d in due] == []
+        assert [j["id"] for j in load_jobs()] == ["late-water"]
+        assert delivered == ["late-water"]
+
     def test_stale_with_claim_skipped_but_record_kept(self, cron_store):
         # A (possibly stale) run_claim means a run may still be in flight in
         # another process — the due-scan must not fire OR retire the record,

@@ -1,11 +1,13 @@
 import { useState } from 'react'
 import { exchangeCode } from '../api'
+import { BackButton } from '../BackButton'
 
 interface ConnectProps {
   onToken: (token: string) => void
+  onLeave?: () => void
 }
 
-export function Connect({ onToken }: ConnectProps) {
+export function Connect({ onToken, onLeave }: ConnectProps) {
   const [code, setCode] = useState('')
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
@@ -38,6 +40,7 @@ export function Connect({ onToken }: ConnectProps) {
 
   return (
     <main className="sheet connect">
+      {onLeave ? <BackButton onClick={onLeave}>返回角色列表</BackButton> : null}
       <p className="kicker">接到这台手机</p>
       <h1>填一次连接码</h1>
       <label>

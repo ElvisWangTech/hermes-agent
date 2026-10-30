@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { disconnectDevice, rememberName } from './api'
+import { BackButton } from './BackButton'
 import { stepFor, type PocketProfile } from './flow'
 import { Connect } from './screens/Connect'
 import { Home } from './screens/Home'
@@ -32,9 +33,15 @@ export function App({ profile: initial }: { profile: PocketProfile }) {
     setAdding(false)
   }
 
+  const leaveAdd = () => {
+    clearPocketStorage()
+    if (previous) select(previous)
+    setChoosing(true)
+  }
+
   if (choosing) return (
     <main className="overlay">
-      <button type="button" onClick={() => setChoosing(false)}>返回</button>
+      <BackButton onClick={() => setChoosing(false)} />
       <h1>切换角色</h1>
       <div className="log">
         {savedRoles().filter(role => stepFor(role) === 'home').map(role => (
@@ -54,20 +61,13 @@ export function App({ profile: initial }: { profile: PocketProfile }) {
   )
 
   if (adding && step !== 'home') return (
-    <>
-      <button type="button" className="past-entry" onClick={() => {
-        clearPocketStorage()
-        if (previous) select(previous)
-        setChoosing(true)
-      }}>返回角色列表</button>
-      {step === 'connect' ? <Connect onToken={token => save({ ...profile, token })} /> : step === 'age' ?
-        <Pick onChoose={characterId => save({ ...profile, characterId })} /> :
-        <Name token={profile.token} characterId={profile.characterId} onNamed={async name => {
-          await rememberName(profile.token, name)
-          save({ ...profile, name })
-          setAdding(false)
-        }} />}
-    </>
+    step === 'connect' ? <Connect onLeave={leaveAdd} onToken={token => save({ ...profile, token })} /> : step === 'age' ?
+      <Pick onLeave={leaveAdd} onChoose={characterId => save({ ...profile, characterId })} /> :
+      <Name onLeave={leaveAdd} token={profile.token} characterId={profile.characterId} onNamed={async name => {
+        await rememberName(profile.token, name)
+        save({ ...profile, name })
+        setAdding(false)
+      }} />
   )
   if (step === 'connect') return <Connect onToken={token => save({ ...profile, token })} />
   if (step === 'age') return <Pick onChoose={characterId => save({ ...profile, characterId })} />

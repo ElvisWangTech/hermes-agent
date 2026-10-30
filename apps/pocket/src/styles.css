@@ -96,6 +96,17 @@ button.back, button.ghost {
   color: #d9c3ae;
 }
 
+button.back {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 2px;
+  width: auto;
+  min-height: 44px;
+  padding: 0 12px 0 0;
+}
+
 button:disabled { opacity: 0.45; }
 
 input {
@@ -115,6 +126,7 @@ input {
 }
 
 .sheet {
+  position: relative;
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -123,6 +135,17 @@ input {
   width: min(440px, 100%);
   margin-inline: auto;
   text-align: center;
+}
+
+.sheet:has(> button.back) {
+  padding-top: calc(64px + env(safe-area-inset-top));
+}
+
+.sheet > button.back {
+  position: absolute;
+  z-index: 2;
+  top: calc(12px + env(safe-area-inset-top));
+  left: 16px;
 }
 
 .sheet.age, .sheet.pick { width: 100%; text-align: left; }
@@ -361,14 +384,81 @@ h1 { font-size: clamp(1.35rem, 4vw, 1.7rem); font-weight: 500; margin: 0; }
   color: #f6e7d4;
 }
 
-.corner-left {
+.corner-menu {
   position: absolute;
   top: calc(12px + env(safe-area-inset-top));
   left: 12px;
-  z-index: 2;
-  display: flex;
-  gap: 4px;
+  z-index: 5;
 }
+
+.corner-speaker {
+  position: absolute;
+  top: calc(12px + env(safe-area-inset-top));
+  right: 12px;
+  z-index: 5;
+}
+
+.corner-speaker .icon-entry.off { color: #8a7a70; }
+
+.top-name {
+  position: absolute;
+  top: calc(12px + env(safe-area-inset-top));
+  left: 0;
+  right: 0;
+  z-index: 2;
+  height: 44px;
+  margin: 0;
+  padding: 0 64px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  font-size: 1.15rem;
+  letter-spacing: 0.14em;
+  text-align: center;
+  width: auto;
+}
+
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 4;
+  min-height: 0;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.menu-panel {
+  position: absolute;
+  top: 52px;
+  left: 0;
+  width: min(280px, calc(100vw - 32px));
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  border-radius: 16px;
+  background: rgba(36, 28, 24, 0.98);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+}
+
+.menu-item {
+  width: 100%;
+  min-height: 44px;
+  height: auto;
+  border-radius: 12px;
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 12px;
+  background: transparent;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.menu-item.danger { color: #d38b73; }
 
 .icon-entry {
   width: 44px;
@@ -378,8 +468,6 @@ h1 { font-size: clamp(1.35rem, 4vw, 1.7rem); font-weight: 500; margin: 0; }
   align-items: center;
   justify-content: center;
 }
-
-.destroy-entry { position: absolute; top: calc(12px + env(safe-area-inset-top)); right: 12px; z-index: 2; color: #d38b73; }
 
 .mic {
   display: inline-flex;
@@ -395,10 +483,44 @@ h1 { font-size: clamp(1.35rem, 4vw, 1.7rem); font-weight: 500; margin: 0; }
 
 .ask-card .caption { white-space: pre-wrap; }
 
+.confirm-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(10, 7, 5, 0.6);
+}
+
+.confirm-dialog {
+  width: min(320px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 22px 20px 18px;
+  border-radius: 20px;
+  background: #2a211c;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
+}
+
+.confirm-dialog h2 { margin: 0; font-size: 1.05rem; color: #f6e7d4; }
+.confirm-dialog p { margin: 0; font-size: 0.92rem; line-height: 1.6; color: #d9c3ae; }
+
+.confirm-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 10px;
+}
+
+.confirm-actions button { flex: 1; }
+.confirm-actions button.danger { background: #8c4a3a; color: #fff8f2; }
+
 .overlay {
   position: fixed;
   inset: 0;
-  z-index: 3;
+  z-index: 6;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -503,7 +625,7 @@ label { display: flex; flex-direction: column; gap: 8px; }
   .home { flex-direction: row; align-items: stretch; gap: 24px; }
   .stage { flex: 1.15; }
   .lower { flex: 0.85; justify-content: center; align-items: flex-start; }
-  .caption, .who { text-align: left; width: min(28rem, 100%); }
+  .caption, .who:not(.top-name) { text-align: left; width: min(28rem, 100%); }
 }
 
 @media (prefers-reduced-motion: reduce) {

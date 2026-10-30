@@ -1,4 +1,5 @@
 import type { ScheduleBoard, ScheduleItem } from './api'
+import { BackButton } from './BackButton'
 import { currentTodos, expiredTodos } from './todos'
 
 export function ScheduleSheet({
@@ -18,7 +19,7 @@ export function ScheduleSheet({
 
   return (
     <section className="overlay" onPointerDown={event => event.stopPropagation()}>
-      <button type="button" className="back" onClick={onClose}>返回</button>
+      <BackButton onClick={onClose} />
       <h1>待办</h1>
       <div className="log">
         {current.length === 0 && expired.length === 0 ? <p className="quiet">还没有待办</p> : null}

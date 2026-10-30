@@ -82,6 +82,14 @@ export function setVoiceEnabled(on: boolean): void {
   localStorage.setItem('pocket.voice', on ? 'on' : 'off')
 }
 
+export function speakerEnabled(): boolean {
+  return localStorage.getItem('pocket.speaker') !== 'off'
+}
+
+export function setSpeakerEnabled(on: boolean): void {
+  localStorage.setItem('pocket.speaker', on ? 'on' : 'off')
+}
+
 export function storedSession(): string {
   return localStorage.getItem('pocket.session') ?? ''
 }
@@ -100,4 +108,5 @@ export function clearPocketStorage(): void {
   localStorage.removeItem(KEY)
   localStorage.removeItem('pocket.session')
   localStorage.removeItem('pocket.voice')
+  localStorage.removeItem('pocket.speaker')
 }

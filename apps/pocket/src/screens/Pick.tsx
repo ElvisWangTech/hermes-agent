@@ -1,18 +1,21 @@
 import { useState } from 'react'
+import { BackButton } from '../BackButton'
 import { ageFace, bands, charactersIn, type BandId, type Character } from '../characters'
 import { Sprite } from '../Sprite'
 
 interface PickProps {
   onChoose: (id: string) => void
+  onLeave?: () => void
 }
 
-export function Pick({ onChoose }: PickProps) {
+export function Pick({ onChoose, onLeave }: PickProps) {
   const [band, setBand] = useState<BandId | null>(null)
   const [index, setIndex] = useState(1)
 
   if (!band) {
     return (
       <main className="sheet age">
+        {onLeave ? <BackButton onClick={onLeave}>返回角色列表</BackButton> : null}
         <h1>选一个年龄段</h1>
         <div className="age-row">
           {bands.map(item => {
@@ -37,9 +40,7 @@ export function Pick({ onChoose }: PickProps) {
 
   return (
     <main className="sheet pick">
-      <button type="button" className="back" onClick={() => setBand(null)}>
-        返回
-      </button>
+      <BackButton onClick={() => setBand(null)} />
       <h1>选一个陪你的人</h1>
       <CharacterSwipe roster={roster} index={index} onIndex={setIndex} />
       <button type="button" className="primary" onClick={() => onChoose(current.id)}>

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { speak } from '../api'
+import { BackButton } from '../BackButton'
 import { findCharacter } from '../characters'
 import { Sprite } from '../Sprite'
 import { cleanName } from '../flow'
@@ -8,9 +9,10 @@ interface NameProps {
   token: string
   characterId: string
   onNamed: (name: string) => Promise<void>
+  onLeave?: () => void
 }
 
-export function Name({ token, characterId, onNamed }: NameProps) {
+export function Name({ token, characterId, onNamed, onLeave }: NameProps) {
   const character = findCharacter(characterId)
   const [draft, setDraft] = useState('')
   const [confirming, setConfirming] = useState(false)
@@ -49,6 +51,7 @@ export function Name({ token, characterId, onNamed }: NameProps) {
 
   return (
     <main className="sheet name">
+      {onLeave ? <BackButton onClick={onLeave}>返回角色列表</BackButton> : null}
       <div className="frame">{character ? <Sprite character={character} className="portrait ask" /> : null}</div>
       <h1>{confirming ? `${name}，就这么叫我吗？` : '你想怎么叫我？'}</h1>
       {confirming ? null : (
