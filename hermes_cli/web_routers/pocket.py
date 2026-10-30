@@ -27,6 +27,23 @@ class PocketCodeBody(BaseModel):
     code: str
 
 
+class PocketUtteranceBody(BaseModel):
+    text: str
+
+
+class PocketProposalBody(BaseModel):
+    id: str
+
+
+class PocketClaimBody(BaseModel):
+    ids: list[str]
+
+
+class PocketHeardBody(BaseModel):
+    id: str
+    delivered: bool = True
+
+
 @router.post("/api/pocket/exchange")
 async def exchange_pocket_code(body: PocketCodeBody):
     from hermes_cli.dashboard_auth.pocket_access import authority
@@ -73,6 +90,78 @@ def name_memory_line(name: str) -> str:
     return f"我的名字是{cleaned}，这是用户给我起的。"
 
 
+def _schedule_call(profile: Optional[str], route: str, fn):
+    scoped = destructive_profile(profile, route)
+
+    def run():
+        try:
+            return fn()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return config_scoped_to_thread(scoped, run)
+
+
+@router.post("/api/pocket/schedules/interpret")
+async def interpret_schedule(body: PocketUtteranceBody, request: Request, profile: Optional[str] = None):
+    from hermes_cli.pocket_schedule import interpret
+
+    identity = getattr(request.state, "pocket_identity", None)
+    if identity is None:
+        raise HTTPException(status_code=403, detail="Device credential required")
+    return await _schedule_call(
+        profile, "POST /api/pocket/schedules/interpret",
+        lambda: interpret(body.text, identity["profile"]),
+    )
+
+
+@router.post("/api/pocket/schedules/confirm")
+async def confirm_schedule(body: PocketProposalBody, profile: Optional[str] = None):
+    from hermes_cli.pocket_schedule import confirm
+
+    return await _schedule_call(profile, "POST /api/pocket/schedules/confirm", lambda: confirm(body.id))
+
+
+@router.post("/api/pocket/schedules/decline")
+async def decline_schedule(body: PocketProposalBody, profile: Optional[str] = None):
+    from hermes_cli.pocket_schedule import decline
+
+    return await _schedule_call(profile, "POST /api/pocket/schedules/decline", lambda: decline(body.id))
+
+
+@router.get("/api/pocket/schedules")
+async def get_schedules(profile: Optional[str] = None):
+    from hermes_cli.pocket_schedule import list_schedules
+
+    return await _schedule_call(profile, "GET /api/pocket/schedules", list_schedules)
+
+
+@router.post("/api/pocket/schedules/claim")
+async def claim_schedules(body: PocketClaimBody, request: Request, profile: Optional[str] = None):
+    from hermes_cli.pocket_schedule import claim
+
+    identity = getattr(request.state, "pocket_identity", None)
+    if identity is None:
+        raise HTTPException(status_code=403, detail="Device credential required")
+    return await _schedule_call(
+        profile, "POST /api/pocket/schedules/claim",
+        lambda: {"items": claim(identity["device_id"], body.ids[:3])},
+    )
+
+
+@router.post("/api/pocket/schedules/heard")
+async def heard_schedule(body: PocketHeardBody, request: Request, profile: Optional[str] = None):
+    from hermes_cli.pocket_schedule import settle
+
+    identity = getattr(request.state, "pocket_identity", None)
+    if identity is None:
+        raise HTTPException(status_code=403, detail="Device credential required")
+    return await _schedule_call(
+        profile, "POST /api/pocket/schedules/heard",
+        lambda: settle(body.id, identity["device_id"], delivered=body.delivered) or {"ok": True},
+    )
+
+
 def _store_line(line: str) -> None:
     from tools.memory_tool_store import MemoryStore
 
@@ -109,6 +198,12 @@ async def destroy_pocket_role(body: PocketNameBody, profile: Optional[str] = Non
             if "No entry matched" not in error:
                 raise HTTPException(status_code=409, detail=error)
 
+    def remove_role() -> None:
+        remove_line()
+        from hermes_cli.pocket_schedule import clear_schedules
+
+        clear_schedules()
+
     scoped = destructive_profile(profile, "DELETE /api/pocket/role")
-    await config_scoped_to_thread(scoped, remove_line)
+    await config_scoped_to_thread(scoped, remove_role)
     return {"ok": True}

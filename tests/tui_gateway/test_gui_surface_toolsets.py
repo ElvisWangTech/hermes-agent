@@ -77,6 +77,11 @@ class TestSurfaceResolution:
         for platform in ("desktop", "tui"):
             assert "project" in server._gui_surface_toolsets(platform)
 
+    def test_pocket_session_gets_the_schedule_toolset_only(self, no_desktop_env):
+        assert server._gui_surface_toolsets("pocket") == {"pocket"}
+        assert "pocket" not in server._gui_surface_toolsets("tui")
+        assert "pocket" not in server._gui_surface_toolsets("desktop")
+
 
 class TestResolverPlumbing:
     def test_posture_path_folds_in_the_session_surface(self, no_desktop_env):

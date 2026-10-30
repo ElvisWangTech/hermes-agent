@@ -617,6 +617,12 @@ def _resolve_single_delivery_target(
     origin = _resolve_origin(job)
     if deliver_value == "local":
         return None
+    # Pocket jobs speak on the character's own devices. There is no gateway adapter.
+    if deliver_value.lower() == "pocket":
+        chat_id = ""
+        if origin and str(origin.get("platform") or "").lower() == "pocket":
+            chat_id = str(origin.get("chat_id") or "")
+        return {"platform": "pocket", "chat_id": chat_id, "_resolved_from": "pocket"}
     # Must precede the generic platform:chat_id split so the profile name isn't parsed as chat_id.
     bot_chat_profile = parse_bot_chat_deliver_token(deliver_value)
     if bot_chat_profile is not None:
@@ -1961,6 +1967,21 @@ def _deliver_result(
     if not targets:
         _record_delivery_verification(job, [])
         return _unresolved_delivery_outcome(job, for_failure)
+
+    # Pocket delivery is a file on this profile's cron store, not a platform adapter.
+    # Write it here so a worker process does not queue it for a second send.
+    pocket_errors: list[str] = []
+    if any(str(target.get("platform") or "").lower() == "pocket" for target in targets):
+        from hermes_cli.pocket_schedule import deliver_to_pocket
+
+        try:
+            deliver_to_pocket(job, content, ok=not for_failure)
+        except Exception as exc:
+            pocket_errors.append(f"pocket delivery failed: {exc}")
+        targets = [target for target in targets if str(target.get("platform") or "").lower() != "pocket"]
+        if not targets:
+            _record_delivery_verification(job, [])
+            return "; ".join(pocket_errors) if pocket_errors else None
 
     # Restart-safe workers have no live gateway adapters: hand the send back through a durable
     # queue so the current or replacement gateway performs it with relay/E2EE parity. The execution

@@ -1527,6 +1527,10 @@ DEFAULT_CONFIG = {
     "honcho": {},
     # IANA timezone (e.g. "Asia/Kolkata", "America/New_York"). Empty = server-local time.
     "timezone": "",
+    # Pocket schedule cap. Missing or empty uses 20. Not a secret; do not mirror into .env.
+    "pocket": {
+        "schedule_limit": 20,
+    },
 
     "slack": {
         "require_mention": True,  # require @mention to respond in channels

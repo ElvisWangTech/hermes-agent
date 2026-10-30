@@ -11,6 +11,12 @@ _HTTP_METHODS = {
     "/api/pocket/name": "POST",
     "/api/pocket/device": "DELETE",
     "/api/pocket/identity": "GET",
+    "/api/pocket/schedules": "GET",
+    "/api/pocket/schedules/interpret": "POST",
+    "/api/pocket/schedules/confirm": "POST",
+    "/api/pocket/schedules/decline": "POST",
+    "/api/pocket/schedules/claim": "POST",
+    "/api/pocket/schedules/heard": "POST",
     "/api/audio/transcribe": "POST",
     "/api/audio/speak": "POST",
 }

@@ -243,9 +243,11 @@ async def _lifespan(app: "FastAPI"):
     )
     hosted_room_start_thread.start()
 
-    # Desktop-spawned backends fire cron jobs themselves, since the app has no
-    # gateway running the scheduler. Server `hermes dashboard` is unaffected —
-    # it relies on its own gateway.
+    # Desktop-spawned backends and headless `hermes serve` (Pocket) fire cron
+    # themselves: neither runs a gateway, so a schedule stored here would never
+    # reach the browser. A browser `hermes dashboard` still leaves ticking to its
+    # gateway. The ticker stands down per profile when a live gateway already
+    # owns that store.
     cron_stop: "threading.Event | None" = None
     cron_thread: "threading.Thread | None" = None
     desktop_owned = is_desktop_owned_backend()
@@ -264,6 +266,7 @@ async def _lifespan(app: "FastAPI"):
         except Exception:
             _log.exception("Desktop startup: orphan gateway reap failed")
 
+    if desktop_owned or getattr(app.state, "tick_own_cron", False):
         cron_stop = threading.Event()
         cron_thread = threading.Thread(
             target=_start_desktop_cron_ticker,
@@ -1565,6 +1568,9 @@ def start_server(
     # The SPA bootstrap reads this so profile-less deep links (/chat?resume=<id>) inherit the
     # launcher's preselected profile instead of silently running in the launch scope (#73085).
     app.state.initial_profile = str(initial_profile or "")
+    # Headless serve has no gateway. Pocket reminders are cron jobs on the
+    # profile store; this process has to tick them or the browser never hears.
+    app.state.tick_own_cron = bool(headless)
 
     config, server = _build_uvicorn_server(host, port, ssh_isolated=bool(ssh_session_token))
 

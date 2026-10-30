@@ -96,6 +96,10 @@ TOOLSETS = {
         "separate tools. Configure via ``hermes tools`` → Video Generation.",
         ["video_generate", "xai_video_edit", "xai_video_extend"],
     ),
+    "pocket": _ts(
+        "Pocket schedule cards. Folded into Pocket sessions only, not the default toolset.",
+        ["pocket_schedule"],
+    ),
     "computer_use": _ts(
         "Background desktop control via cua-driver (macOS/Windows/Linux) — "
         "screenshots, mouse, keyboard, scroll, drag. Does NOT steal the user's cursor "

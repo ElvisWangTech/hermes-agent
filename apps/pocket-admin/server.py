@@ -270,7 +270,10 @@ def create_app(home: Path, *, secure_cookies: bool = False) -> FastAPI:
 
     @application.delete("/api/pocket/roles/{role_id}/authorization")
     def disable(role_id: str):
+        profile = authority.role_profile(role_id)
         authority.disable_role(role_id)
+        if profile:
+            _hold_profile_schedules(profile)
         return {"ok": True}
 
     @application.get("/{asset_path:path}")
@@ -284,6 +287,21 @@ def create_app(home: Path, *, secure_cookies: bool = False) -> FastAPI:
         return FileResponse(target)
 
     return application
+
+
+def _hold_profile_schedules(profile: str) -> None:
+    """Pause this profile's schedules when authorization is turned off.
+
+    A later authorization does not resume them; the user continues each one.
+    """
+    try:
+        _normalized, scope = _profile_config_scope(profile)
+    except ValueError:
+        return
+    with scope:
+        from hermes_cli.pocket_schedule import hold_for_authorization
+
+        hold_for_authorization()
 
 
 def _profile_config_scope(profile: str):

@@ -1,4 +1,4 @@
-export const voiceInstruction = '\n\n[POCKET_VOICE_REQUEST]\n请先正常完整回答，再在回复末尾使用 <pocket-voice-summary> 和 </pocket-voice-summary> 包住口语摘要。摘要使用回复原语言，2到4个短句，中文不超过180字；保留主要结论、关键数字、提醒和下一步。表格只概括结论和比较，不逐行朗读；不要朗读代码、网址或Markdown标记，不添加原文没有的事实。\n[/POCKET_VOICE_REQUEST]'
+export const voiceInstruction = '\n\n[POCKET_VOICE_REQUEST]\n请先正常完整回答，再在回复末尾使用 <pocket-voice-summary> 和 </pocket-voice-summary> 包住口语摘要。摘要使用回复原语言，2到4个短句，中文不超过180字；保留主要结论、关键数字、提醒和下一步。表格只概括结论和比较，不逐行朗读；不要朗读代码、网址或Markdown标记，不添加原文没有的事实。用户要定提醒、闹钟或到点去做的事，或要查看、暂停、继续、取消、改时间时，调用 pocket_schedule。查看待办时用 list，页面会自己打开列表并播报最近的几条，摘要里不要再念一遍。用用户的语言理解时间。钟点没说清就先问，不要猜，也不要说已经记下。创建调用成功后页面会自己说已经记下，摘要里不要重复这句，也不要再请用户确认。暂停、继续、取消、改时间仍要等用户确认。\n[/POCKET_VOICE_REQUEST]'
 
 export function voiceReply(text: string): { text: string; summary: string } {
   const start = text.indexOf('<pocket-voice-summary>')
@@ -11,7 +11,9 @@ export function voiceReply(text: string): { text: string; summary: string } {
 }
 
 export function visibleUserText(text: string): string {
-  return text.endsWith(voiceInstruction) ? text.slice(0, -voiceInstruction.length) : text
+  const marker = text.indexOf('[POCKET_VOICE_REQUEST]')
+
+  return (marker >= 0 ? text.slice(0, marker) : text).trim()
 }
 
 import { unified } from 'unified'

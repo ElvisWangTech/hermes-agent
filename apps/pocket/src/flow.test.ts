@@ -14,6 +14,27 @@ describe('listSessions', () => {
     const client = { request: async () => ({ sessions: [{ id: 'cli-session', source: 'cli' }] }) }
     expect(await listSessions(client as unknown as JsonRpcGatewayClient)).toEqual([])
   })
+
+  it('drops the voice instruction from a truncated session preview', async () => {
+    const client = {
+      request: async () => ({
+        sessions: [{
+          id: 'pocket-session',
+          source: 'pocket',
+          title: '好 [POCKET_VOICE_REQUEST] 请先',
+          preview: '一盒 [POCKET_VOICE_REQUEST] 请',
+          started_at: 1
+        }]
+      })
+    }
+
+    expect(await listSessions(client as unknown as JsonRpcGatewayClient)).toEqual([{
+      id: 'pocket-session',
+      title: '好',
+      preview: '一盒',
+      started_at: 1
+    }])
+  })
 })
 
 describe('exchangeCode', () => {

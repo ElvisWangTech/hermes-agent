@@ -121,8 +121,8 @@ export async function listSessions(client: JsonRpcGatewayClient): Promise<PastSe
 
   return pocket.map(row => ({
     id: row.id,
-    title: row.title || '对话',
-    preview: row.preview || '',
+    title: visibleUserText(row.title || '').replace(/\s+/g, ' ') || '对话',
+    preview: visibleUserText(row.preview || '').replace(/\s+/g, ' '),
     started_at: row.started_at || 0
   }))
 }
@@ -154,14 +154,18 @@ export function watchTurn(
     onDelta: (chunk: string) => void
     onComplete: (text: string) => void
     onTool: () => void
+    onSchedule?: (result: ScheduleRead) => void
   }
 ): () => void {
   return client.onEvent(event => {
     if (event.session_id && event.session_id !== sessionId) return
-    const payload = event.payload as { text?: string } | undefined
+    const payload = event.payload as { text?: string; name?: string; result?: ScheduleRead } | undefined
 
     if (event.type === 'message.delta' && payload?.text) handlers.onDelta(payload.text)
     if (event.type === 'tool.start') handlers.onTool()
+    if (event.type === 'tool.complete' && payload?.name === 'pocket_schedule' && payload.result) {
+      handlers.onSchedule?.(payload.result)
+    }
     if (event.type === 'message.complete') handlers.onComplete(typeof payload?.text === 'string' ? payload.text : '')
   })
 }
@@ -197,6 +201,82 @@ export async function speak(token: string, text: string): Promise<string> {
   if (!body.data_url) throw new Error('语音还没准备好')
 
   return body.data_url
+}
+
+export interface ScheduleItem {
+  id: string
+  name: string
+  when: string
+  next: string
+  paused: boolean
+  expired?: boolean
+  created_at?: string
+  last_text: string
+  last_ok: boolean | null
+}
+
+export interface ScheduleProposal {
+  id: string
+  title: string
+  body: string
+  allow: string
+  deny: string
+}
+
+export interface DueLine {
+  id: string
+  text: string
+  ok: boolean
+}
+
+export type ScheduleRead =
+  | { type: 'chat' }
+  | { type: 'list'; speech: string }
+  | { type: 'clarify'; question: string; pending: string }
+  | { type: 'proposal' } & ScheduleProposal
+  | { type: 'saved'; speech: string; id: string }
+
+export interface ScheduleBoard {
+  items: ScheduleItem[]
+  unheard: { id: string; text: string }[]
+  said: { text: string; ok: boolean }[]
+}
+
+async function pocketJson<T>(token: string, path: string, method: string, body?: unknown): Promise<T> {
+  const response = await fetch(path, {
+    method,
+    headers: authHeaders(token),
+    body: body === undefined ? undefined : JSON.stringify(body)
+  })
+  const payload = await response.json().catch(() => ({})) as T & { detail?: string }
+
+  if (!response.ok) throw new Error(payload.detail || '日程没有完成')
+
+  return payload
+}
+
+export function interpretSchedule(token: string, text: string): Promise<ScheduleRead> {
+  return pocketJson(token, '/api/pocket/schedules/interpret', 'POST', { text })
+}
+
+export function confirmSchedule(token: string, id: string): Promise<{ speech: string }> {
+  return pocketJson(token, '/api/pocket/schedules/confirm', 'POST', { id })
+}
+
+export function declineSchedule(token: string, id: string): Promise<{ speech: string }> {
+  return pocketJson(token, '/api/pocket/schedules/decline', 'POST', { id })
+}
+
+export function loadSchedules(token: string): Promise<ScheduleBoard> {
+  return pocketJson(token, '/api/pocket/schedules', 'GET')
+}
+
+export function claimSchedules(token: string, ids: string[]): Promise<{ items: DueLine[] }> {
+  return pocketJson(token, '/api/pocket/schedules/claim', 'POST', { ids })
+}
+
+export function settleSchedule(token: string, id: string, delivered: boolean): Promise<{ ok: boolean }> {
+  return pocketJson(token, '/api/pocket/schedules/heard', 'POST', { id, delivered })
 }
 
 function blobToDataUrl(blob: Blob): Promise<string> {

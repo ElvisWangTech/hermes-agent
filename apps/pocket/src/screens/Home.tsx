@@ -1,24 +1,34 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import type { ServerRequest } from '@hermes/shared'
-import { Mic, MicOff } from 'lucide-react'
+import { History, ListTodo, Mic, MicOff, Unplug } from 'lucide-react'
 import {
+  claimSchedules,
+  confirmSchedule,
+  declineSchedule,
   ensureSession,
   interruptSession,
   listSessions,
+  loadSchedules,
   openGateway,
   readSession,
+  settleSchedule,
   speak,
   submitText,
   transcribe,
   watchTurn,
   type PastSession,
+  type ScheduleBoard,
+  type ScheduleProposal,
+  type ScheduleRead,
   type TurnLine
 } from '../api'
+import { ScheduleSheet } from '../ScheduleSheet'
 import { findCharacter, type Mood } from '../characters'
 import type { FigureHandle } from '../live2d/Stage'
 import { heardLevel, lookAt, type LookPoint } from '../live2d/pose'
 import { type PocketProfile } from '../flow'
 import { speechText, voiceReply } from '../speech'
+import { nearestTodoSpeech, remindAsFriend, wantsTodoList } from '../todos'
 import { openEar, type Ear } from '../listen'
 import { measurePlayback } from '../audio'
 import { Portrait } from '../Portrait'
@@ -26,6 +36,7 @@ import { Markdown } from '../Markdown'
 import { Waveform } from '../Waveform'
 import { ClarifyCard } from '../ClarifyCard'
 import { rememberSession, setVoiceEnabled, storedSession, voiceEnabled } from '../storage'
+import { closeDueNotice, dueOutlet, readNoticePermission, requestNoticePermission, showDueNotice } from '../dueNotice'
 
 interface HomeProps {
   profile: PocketProfile
@@ -58,10 +69,14 @@ export function Home({ profile, onReset, onDestroy, onSwitch }: HomeProps) {
   const [past, setPast] = useState<PastSession[] | null>(null)
   const [reading, setReading] = useState<{ title: string; lines: TurnLine[] } | null>(null)
   const [ask, setAsk] = useState<Ask | null>(null)
+  const [proposal, setProposal] = useState<ScheduleProposal | null>(null)
+  const [board, setBoard] = useState<ScheduleBoard | null>(null)
+  const [todos, setTodos] = useState(false)
   const [clarify, setClarify] = useState<ServerRequest | null>(null)
   const [voiceNote, setVoiceNote] = useState('')
   const [inputLevel, setInputLevel] = useState(0)
   const [outputLevel, setOutputLevel] = useState(0)
+  const [dueToast, setDueToast] = useState<{ id: string; text: string } | null>(null)
   const sessionId = useRef('')
   const clientRef = useRef<Awaited<ReturnType<typeof openGateway>> | null>(null)
   const earRef = useRef<Ear | null>(null)
@@ -70,6 +85,13 @@ export function Home({ profile, onReset, onDestroy, onSwitch }: HomeProps) {
   const pending = useRef('')
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const generation = useRef(0)
+  const sayRef = useRef<(text: string) => Promise<void>>(async () => {})
+  const openTodosRef = useRef<(announce: boolean) => Promise<void>>(async () => {})
+  const proposalRef = useRef<ScheduleProposal | null>(null)
+  const clarifyRef = useRef<string | null>(null)
+  const noticeAsked = useRef(false)
+  const clarifyVoiceRef = useRef<(text: string) => boolean>(() => false)
+  const cardRef = useRef(false)
   const pressTimer = useRef(0)
   const holding = useRef(false)
   const origin = useRef({ x: 0, y: 0 })
@@ -79,6 +101,7 @@ export function Home({ profile, onReset, onDestroy, onSwitch }: HomeProps) {
   const look = useRef<LookPoint>({ x: 0, y: 0 })
 
   mutedRef.current = muted
+  cardRef.current = Boolean(ask || proposal || clarify)
 
   const stopSpeech = () => {
     generation.current += 1
@@ -143,10 +166,80 @@ export function Home({ profile, onReset, onDestroy, onSwitch }: HomeProps) {
     void pump(profile.token)
   }
 
+  const showRead = (read: ScheduleRead) => {
+    if (read.type === 'list') {
+      clarifyRef.current = null
+      void openTodosRef.current(true)
+      return
+    }
+    if (read.type === 'clarify') {
+      clarifyRef.current = read.pending
+      setCaption(read.question)
+      if (!mutedRef.current) enqueue(read.question)
+      else setMood('wait')
+      return
+    }
+    if (read.type === 'saved') {
+      clarifyRef.current = null
+      setCaption(read.speech)
+      if (!mutedRef.current) enqueue(read.speech)
+      void loadSchedules(profile.token).then(setBoard).catch(() => undefined)
+      return
+    }
+    if (read.type === 'proposal') {
+      clarifyRef.current = null
+      const next = { id: read.id, title: read.title, body: read.body, allow: read.allow, deny: read.deny }
+
+      proposalRef.current = next
+      cardRef.current = true
+      setProposal(next)
+      setMood('wait')
+    }
+  }
+
+  const finishProposal = async (accepted: boolean) => {
+    const current = proposalRef.current
+
+    if (!current) return
+    proposalRef.current = null
+    setProposal(null)
+    try {
+      const result = accepted
+        ? await confirmSchedule(profile.token, current.id)
+        : await declineSchedule(profile.token, current.id)
+
+      setCaption(result.speech)
+      if (!mutedRef.current) enqueue(result.speech)
+      setMood(mutedRef.current ? 'wait' : 'idle')
+      if (board) setBoard(await loadSchedules(profile.token))
+    } catch (error) {
+      setVoiceNote(error instanceof Error ? error.message : '没记下')
+    }
+  }
+
   const say = async (text: string) => {
     const clean = text.trim()
 
-    if (!clean || !sessionId.current || !clientRef.current) return
+    if (!clean) return
+    const open = proposalRef.current
+
+    if (open && (clean === '确认' || clean === open.allow)) {
+      await finishProposal(true)
+      return
+    }
+    if (open && (clean === '取消' || clean === '不用' || clean === open.deny)) {
+      await finishProposal(false)
+      return
+    }
+    if (clarify) {
+      if (!clarifyVoiceRef.current(clean)) setVoiceNote('没对上。点一条，或者说得再具体一点')
+      return
+    }
+    if (wantsTodoList(clean)) {
+      await openTodosRef.current(true)
+      return
+    }
+    if (!sessionId.current || !clientRef.current) return
     stopSpeech()
     busyRef.current = false
     setMood('think')
@@ -167,10 +260,12 @@ export function Home({ profile, onReset, onDestroy, onSwitch }: HomeProps) {
     }
   }
 
+  sayRef.current = say
+
   const heard = (blob: Blob) => {
     void transcribe(profile.token, blob)
       .then(text => {
-        if (text) void say(text)
+        if (text) void sayRef.current(text)
         else setVoiceNote('没听清，可以按住再说，或者上滑打字')
       })
       .catch((error: unknown) => {
@@ -249,6 +344,7 @@ export function Home({ profile, onReset, onDestroy, onSwitch }: HomeProps) {
             setCaption(voiceReply(pending.current).text)
           },
           onTool: () => { if (busyRef.current) setMood('think') },
+          onSchedule: read => { if (read.type !== 'chat') showRead(read) },
           onComplete: text => {
             if (!busyRef.current) return
             busyRef.current = false
@@ -298,6 +394,105 @@ export function Home({ profile, onReset, onDestroy, onSwitch }: HomeProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile.name, profile.token])
 
+  useEffect(() => {
+    let stop = false
+    let mode: 'backlog' | 'live' = 'backlog'
+    const skipped = new Set<string>()
+
+    const speakLine = async (text: string) => {
+      const ticket = generation.current
+
+      setCaption(text)
+      if (mutedRef.current) {
+        setVoiceNote('文字回复')
+        return ticket === generation.current
+      }
+      speaking.current = true
+      setMood('think')
+      try {
+        const url = await speak(profile.token, text)
+
+        if (ticket !== generation.current) return false
+        await play(url, ticket, generation, audioRef, () => setMood('speak'), level => {
+          if (ticket === generation.current) setOutputLevel(level)
+        })
+        return ticket === generation.current
+      } catch {
+        setVoiceNote('语音还没准备好，可以先看字幕')
+        return false
+      } finally {
+        if (ticket === generation.current) {
+          speaking.current = false
+          setOutputLevel(0)
+          if (!busyRef.current) setMood(mutedRef.current ? 'wait' : 'idle')
+        }
+      }
+    }
+
+    let prefer: string | null = null
+
+    const tick = async () => {
+      if (stop || busyRef.current || speaking.current || cardRef.current || clarifyRef.current) return
+      let loaded: ScheduleBoard
+      try {
+        loaded = await loadSchedules(profile.token)
+      } catch {
+        return
+      }
+      if (stop || busyRef.current || speaking.current || cardRef.current || clarifyRef.current) return
+      const pending = loaded.unheard.filter(item => !skipped.has(item.id))
+      if (!pending.length) return
+      const chosen = prefer
+      prefer = null
+      if (!chosen && dueOutlet(document.hidden, readNoticePermission()) !== 'speak') {
+        const next = pending[0]
+        if (dueOutlet(true, readNoticePermission()) === 'notify') {
+          showDueNotice(next.id, profile.name, next.text, id => {
+            prefer = id
+            void tick()
+          })
+        }
+        return
+      }
+      const thisMode = mode
+
+      mode = 'live'
+      const opened = chosen ? pending.filter(item => item.id === chosen).slice(0, 1) : []
+      const batch = opened.length ? opened : thisMode === 'backlog' ? pending.slice(0, 3) : pending.slice(0, 1)
+
+      if (!chosen && thisMode === 'backlog') pending.slice(3).forEach(item => skipped.add(item.id))
+      if (!batch.length) return
+      batch.forEach(item => closeDueNotice(item.id))
+      const claimed = await claimSchedules(profile.token, batch.map(item => item.id)).catch(() => ({ items: [] }))
+
+      for (const item of claimed.items) {
+        if (stop || cardRef.current || clarifyRef.current) {
+          await settleSchedule(profile.token, item.id, false).catch(() => undefined)
+          continue
+        }
+        const spoken = remindAsFriend(item.text)
+        setDueToast({ id: item.id, text: item.text })
+        const cued = await speakLine(spoken.cue)
+        if (!cued) {
+          await settleSchedule(profile.token, item.id, false).catch(() => undefined)
+          break
+        }
+        const delivered = await speakLine(spoken.line)
+
+        await settleSchedule(profile.token, item.id, delivered).catch(() => undefined)
+        if (!delivered) break
+      }
+    }
+
+    void tick()
+    const timer = window.setInterval(() => { void tick() }, 4000)
+
+    return () => {
+      stop = true
+      window.clearInterval(timer)
+    }
+  }, [profile.token])
+
   if (!character) return null
 
   const toggleMute = () => {
@@ -310,6 +505,10 @@ export function Home({ profile, onReset, onDestroy, onSwitch }: HomeProps) {
   }
 
   const onPointerDown = (event: ReactPointerEvent) => {
+    if (!noticeAsked.current && readNoticePermission() === 'default') {
+      noticeAsked.current = true
+      void requestNoticePermission()
+    }
     origin.current = { x: event.clientX, y: event.clientY }
     window.clearTimeout(pressTimer.current)
     pressTimer.current = window.setTimeout(() => {
@@ -357,6 +556,22 @@ export function Home({ profile, onReset, onDestroy, onSwitch }: HomeProps) {
     look.current = { x: 0, y: 0 }
   }
 
+  const openTodos = async (announce = false) => {
+    setSheet(false)
+    try {
+      const loaded = await loadSchedules(profile.token)
+      setBoard(loaded)
+      setTodos(true)
+      if (!announce) return
+      const speech = nearestTodoSpeech(loaded.items)
+      setCaption(speech)
+      if (!mutedRef.current) enqueue(speech)
+    } catch {
+      setVoiceNote('待办没有打开')
+    }
+  }
+  openTodosRef.current = openTodos
+
   const onPointerMove = (event: ReactPointerEvent) => {
     const stage = event.target instanceof Element ? event.target.closest('.stage') : null
 
@@ -377,38 +592,70 @@ export function Home({ profile, onReset, onDestroy, onSwitch }: HomeProps) {
     >
       <button
         type="button"
-        className="ghost destroy-entry"
+        className="ghost icon-entry destroy-entry"
+        aria-label="断开此设备"
+        title="断开此设备"
         onPointerDown={event => event.stopPropagation()}
         onClick={() => {
           if (!window.confirm('断开此设备并清除本地缓存？角色、记忆、历史对话和其他设备不受影响。')) return
           void onDestroy().catch(() => setVoiceNote('设备还没有断开，请稍后再试'))
         }}
       >
-        断开此设备
+        <Unplug size={22} aria-hidden="true" />
       </button>
-      <button
-        type="button"
-        className="ghost past-entry"
-        onPointerDown={event => event.stopPropagation()}
-        onClick={() => {
-          setReading(null)
-          const client = clientRef.current
+      {dueToast && (
+        <div className="due-toast" role="status">
+          <div className="due-toast-copy">
+            <p className="due-toast-cue">想提醒你</p>
+            <p className="due-toast-body">{dueToast.text}</p>
+          </div>
+          <button
+            type="button"
+            className="due-toast-dismiss"
+            onPointerDown={event => event.stopPropagation()}
+            onClick={() => setDueToast(null)}
+          >
+            知道了
+          </button>
+        </div>
+      )}
+      <div className="corner-left">
+        <button
+          type="button"
+          className="ghost icon-entry"
+          aria-label="以前的对话"
+          title="以前的对话"
+          onPointerDown={event => event.stopPropagation()}
+          onClick={() => {
+            setReading(null)
+            const client = clientRef.current
 
-          if (!client) return
-          void listSessions(client).then(setPast).catch(() => setPast([]))
-        }}
-      >
-        以前
-      </button>
+            if (!client) return
+            void listSessions(client).then(setPast).catch(() => setPast([]))
+          }}
+        >
+          <History size={22} aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          className="ghost icon-entry"
+          aria-label="待办"
+          title="待办"
+          onPointerDown={event => event.stopPropagation()}
+          onClick={() => { void openTodos() }}
+        >
+          <ListTodo size={22} aria-hidden="true" />
+        </button>
+      </div>
       <Portrait
         character={character}
         figure={figureRef}
         look={look.current}
-        input={{ mood, muted, confirming: Boolean(ask || clarify), inputLevel, outputLevel }}
+        input={{ mood, muted, confirming: Boolean(ask || clarify || proposal), inputLevel, outputLevel }}
       />
       <section className="lower">
         <p className="who">{profile.name}</p>
-        <p className="note" role="status">{status || (ask ? '等你确认' : mood === 'speak' ? '正在说话' : mood === 'think' ? '正在思考' : inputLevel > heardLevel ? '正在听' : muted ? '麦克风已关闭' : voiceNote ? '文字回复' : '等你开口')}</p>
+        <p className="note" role="status">{status || (ask || proposal || clarify ? '等你确认' : mood === 'speak' ? '正在说话' : mood === 'think' ? '正在思考' : inputLevel > heardLevel ? '正在听' : muted ? '麦克风已关闭' : voiceNote ? '文字回复' : '等你开口')}</p>
         <div className="audio-levels">
           <Waveform label="你" level={inputLevel} />
           <Waveform label={profile.name} level={outputLevel} />
@@ -434,6 +681,10 @@ export function Home({ profile, onReset, onDestroy, onSwitch }: HomeProps) {
             返回
           </button>
           <button type="button" onClick={onSwitch}>切换角色</button>
+          <button type="button" onClick={() => {
+            setSheet(false)
+            openTodos()
+          }}>待办</button>
           <div className="log">
             {turns.map((turn, index) => (
               <div className="message" key={`${turn.role}-${index}`}>
@@ -498,8 +749,29 @@ export function Home({ profile, onReset, onDestroy, onSwitch }: HomeProps) {
           )}
         </section>
       ) : null}
+      {todos ? (
+        <ScheduleSheet
+          board={board}
+          onClose={() => setTodos(false)}
+          onUtterance={text => { void sayRef.current(text) }}
+        />
+      ) : null}
       {ask ? <AskCard ask={ask} onClose={() => setAsk(null)} /> : null}
-      {clarify ? <ClarifyCard key={clarify.id} request={clarify} onClose={() => setClarify(null)} /> : null}
+      {proposal ? (
+        <AskCard
+          ask={{
+            title: proposal.title,
+            body: proposal.body,
+            needsText: false,
+            allow: proposal.allow,
+            deny: proposal.deny,
+            onAllow: () => { void finishProposal(true) },
+            onDeny: () => { void finishProposal(false) }
+          }}
+          onClose={() => {}}
+        />
+      ) : null}
+      {clarify ? <ClarifyCard key={clarify.id} request={clarify} voiceRef={clarifyVoiceRef} onClose={() => setClarify(null)} /> : null}
     </main>
   )
 }

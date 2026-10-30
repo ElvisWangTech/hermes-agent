@@ -1123,6 +1123,32 @@ def test_named_profile_action_isolates_parent_env_and_loads_target_env(monkeypat
 # ---------------------------------------------------------------------------
 
 
+def test_headless_serve_ticks_cron_without_a_desktop_session(monkeypatch):
+    """Pocket's `hermes serve` stores schedules but runs no gateway, so it must tick."""
+    import hermes_cli.web_server as ws
+
+    started = []
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
+    monkeypatch.setattr(ws, "is_desktop_owned_backend", lambda: False)
+    monkeypatch.setattr(ws, "_start_desktop_cron_ticker", lambda *_args, **_kwargs: started.append(True))
+    monkeypatch.setattr(ws, "_warm_gateway_module", lambda: None)
+    ws.app.state.tick_own_cron = False
+    client, _header = _client()
+    with client:
+        pass
+    assert started == []
+
+    ws.app.state.tick_own_cron = True
+    try:
+        client, _header = _client()
+        with client:
+            pass
+        assert started == [True]
+    finally:
+        ws.app.state.tick_own_cron = False
+
+
 def test_desktop_lifespan_terminates_managed_gateway_restart(monkeypatch):
     """A Desktop-owned gateway child must not survive its serve backend."""
     import hermes_cli.web_server as ws

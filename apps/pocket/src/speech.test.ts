@@ -11,6 +11,7 @@ it('separates the complete response from its spoken summary', () => {
 
 it('hides only the appended voice instruction in user history', () => {
   expect(visibleUserText('天气如何？' + voiceInstruction)).toBe('天气如何？')
+  expect(visibleUserText('好 [POCKET_VOICE_REQUEST] 请先')).toBe('好')
   expect(visibleUserText('普通问题')).toBe('普通问题')
 })
 

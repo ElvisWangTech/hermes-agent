@@ -2174,6 +2174,13 @@ def _prepare_job_prompt(
     """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
     result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
     injection block, empty prompt); otherwise ``prompt`` is set."""
+    # A Pocket reminder already knows the sentence. Say that sentence; do not start a model.
+    from hermes_cli.pocket_schedule import reminder_phrase
+
+    phrase = reminder_phrase(job)
+    if phrase:
+        return (True, "", phrase, None), None
+
     # Fail closed on a corrupt config.yaml: defaults would let auto-detection bill a provider the
     # user never chose. no_agent jobs are exempt. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
     if not job.get("no_agent"):

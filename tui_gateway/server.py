@@ -1862,7 +1862,11 @@ def _gui_surface_toolsets(platform: str) -> set[str]:
     ``platform`` is the SESSION's source, never a process env var: the desktop may drive a URL/cloud
     backend where ``HERMES_DESKTOP`` is unset (AGENTS.md surface rule)."""
     from toolsets import CLIENT_SURFACE_TOOLSETS
-    return set(CLIENT_SURFACE_TOOLSETS) if platform == "desktop" else {"project"}
+    if platform == "desktop":
+        return set(CLIENT_SURFACE_TOOLSETS)
+    if platform == "pocket":
+        return {"pocket"}
+    return {"project"}
 
 
 def _with_session_toolsets(selection, platform: str | None) -> list[str]:
@@ -2020,7 +2024,7 @@ def _tool_progress_enabled(sid: str) -> bool:
 # `isFileEditTool` in apps/desktop/src/lib/tool-render-class.ts must stay in sync with this
 # set (test_gateway_lifecycle_set_covers_desktop_card_tools pins the direction that matters).
 _TOOL_LIFECYCLE_UI_TOOLS = frozenset({
-    "clarify", "manage_connections", "setup_mcp",
+    "clarify", "manage_connections", "setup_mcp", "pocket_schedule",
     "image_generate", "manage_catalog", "delegate_task",
     # File edits are the turn's deliverable — the diff card the user reviews.
     "edit_file", "patch", "write_file",

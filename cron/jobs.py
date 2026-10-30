@@ -2551,19 +2551,32 @@ def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
             job.get("name", job.get("id", "?")))
 
 
-def _write_missed_oneshot_diagnostic(job: Dict[str, Any], next_run: str) -> None:
-    """Trace for a never-ran one-shot retired outside the grace window (else it would just vanish).
-    """
-    _write_oneshot_diagnostic(
-        job,
-        "# Cron job removed before firing (run time outside grace window)\n\n"
-        f"- job id: {job.get('id')}\n"
-        f"- name: {job.get('name')}\n"
-        f"- scheduled run time: {next_run}\n"
-        f"- grace window: {ONESHOT_GRACE_SECONDS}s\n"
-        f"- removed at: {_hermes_now().isoformat()}\n\n"
-        "This one-shot's run time is more than the grace window in the "
-        "past (scheduler down past the window, host asleep, or jobs.json "
+def _is_pocket_reminder(job: Dict[str, Any]) -> bool:
+    origin = job.get("origin")
+    return (
+        isinstance(origin, dict)
+        and str(origin.get("platform") or "").lower() == "pocket"
+        and origin.get("pocket_kind") == "remind"
+    )
+
+
+def _deliver_late_pocket_reminder(job: Dict[str, Any]) -> None:
+    """A Pocket reminder is the sentence the user asked to hear. Say it once,
+    and keep the schedule so the list can fold it under 已过期."""
+    if not _is_pocket_reminder(job):
+        return
+    phrase = str((job.get("origin") or {}).get("pocket_phrase") or "").strip()
+    if not phrase:
+        return
+    from hermes_cli.pocket_schedule import _db, deliver_to_pocket
+
+    job_id = str(job.get("id") or "")
+    with _db() as database:
+        already = database.execute(
+            "SELECT 1 FROM inbox WHERE job_id = ? LIMIT 1", (job_id,)
+        ).fetchone()
+    if already:
+        return
         "edited), which is outside the 'will never fire' contract "
         "enforced at create/update/resume time. The job was removed "
         "without running; recreate it (or use the Run button) to "
@@ -3133,6 +3146,7 @@ def _retire_expired_oneshot(d: _DueJob) -> bool:
     if _elapsed_seconds(d.scan.now, d.next_run_dt) <= ONESHOT_GRACE_SECONDS:
         return False
     if not (d.job.get("run_claim") or d.job.get("fire_claim")):
+        _deliver_late_pocket_reminder(d.job)
         _write_missed_oneshot_diagnostic(d.job, d.next_run)
         d.scan.retire(d.job["id"])
         record_cron_missed(d.job)
@@ -3147,8 +3161,10 @@ def _oneshot_dispatch_limit_reached(job: Dict[str, Any], scan: _DueScan) -> bool
     process is still running it (a run outliving the run_claim TTL is slow, not stale)."""
     repeat = job.get("repeat") or {}
     times = repeat.get("times")
-    completed = repeat.get("completed", 0)
-    if times is None or times <= 0 or completed < times:
+    if _is_pocket_reminder(d.job):
+        _deliver_late_pocket_reminder(d.job)
+        return True
+    if not (d.job.get("run_claim") or d.job.get("fire_claim")):
         return False
     name = job.get("name", job.get("id", "?"))
     # A live run must never have its job record deleted underneath it (#62002): a run that outlives the

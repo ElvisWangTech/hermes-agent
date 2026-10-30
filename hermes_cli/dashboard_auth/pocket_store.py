@@ -119,6 +119,13 @@ class PocketAuthority:
                 (device_id, profile_id),
             )
 
+    def role_profile(self, profile_id: str) -> str | None:
+        with self._connect() as database:
+            row = database.execute(
+                "SELECT profile FROM pocket_roles WHERE id = ?", (profile_id,),
+            ).fetchone()
+        return row["profile"] if row else None
+
     def disable_role(self, profile_id: str) -> None:
         with self._connect() as database:
             database.execute("UPDATE pocket_roles SET active = 0 WHERE id = ?", (profile_id,))
