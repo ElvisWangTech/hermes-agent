@@ -9,6 +9,10 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+# Also the control-plane authority file (gateway/coordination). The name predates it;
+# renaming would orphan issued Pocket devices.
+AUTHORITY_FILENAME = "pocket-auth.sqlite"
+
 
 class PocketAuthority:
     def __init__(self, path: Path):

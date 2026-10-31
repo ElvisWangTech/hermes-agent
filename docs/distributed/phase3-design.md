@@ -1,96 +1,100 @@
-# Hermes 分布式改造 · Phase 3 详细设计（默认跳过）
+# Hermes 分布式改造 · Phase 3：沙箱提供者与路由
 
-> 版本：v1.2 ｜ 状态：待确认 ｜ 前置：无硬依赖
->
-> **默认建议：跳过本阶段。** 多租户隔离应复用已有 `tools/environments/`（docker / ssh / modal / daytona / singularity），而不是再做一套「每工具 gRPC + 一次性容器」。
->
-> 相对 v1.0 的撤回：ToolGateway、gRPC `Execute`、每请求一次性容器、按 `risk_level` 把 L2 工具全部 RPC 出去、默认插件 L2、把沙箱当 Phase 5 必选组件。
+> 版本：v3.0 ｜ 状态：待确认 ｜ 前置：[Phase 0](phase0-design.md)、[Phase 1](phase1-design.md)、[Phase 2](phase2-design.md)
 
 ---
 
-## 1. 是否实施
+## 1. 组件
 
-| 条件 | 建议 |
+| 组件 | 位置 | 职责 |
+|---|---|---|
+| 网关 | 控制面 | 准入（Phase 2）、profile → 实例路由、HTTP/SSE/WebSocket 代理 |
+| Sandbox Manager | 控制面 | 实例生命周期、租约、挂载与网络参数、密钥注入 |
+| 节点代理 | 每个 Cube 节点 | 准备目录、暂停/恢复时拷贝快照、恢复目录 |
+| Provider 接口 | 核心仓库 | 只定义 `create / pause / resume / destroy / status / endpoint` |
+| Cube provider | **独立包**（仓库外） | 调用 Cube SDK 实现接口，版本与 Cube 兼容矩阵单独维护 |
+| 开发 provider | 核心仓库 | 本地进程，无隔离，启动时拒绝在非开发环境使用 |
+
+核心仓库不包含 Cube 代码。这符合 `docs/distributed/README.md` 的 rubric：第三方产品的连接器不进入核心树。
+
+## 2. 实例生命周期
+
+| 操作 | 步骤 |
 |---|---|
-| 自有团队 / 个人、输入可信 | **跳过**。现有 docker 后端 + 审批钩子足够。 |
-| 多租户但可接受「会话级容器/远程机」而非「每调用新容器」 | **跳过代码阶段**；运维上强制 `terminal.backend=docker`（或 modal/daytona）。 |
-| 现有 backend 无法满足合规，必须额外隔离平面 | 才评估本阶段；且实施形态是 **新 environment provider**，不是工具 RPC 总线。 |
+| create | 节点代理准备目录（属主为租户 UID，权限 0700）→ 若无 `config.yaml`，从默认 home 复制初始内容 → 注入密钥 → 创建 VM → 启动 api_server → 健康检查 |
+| pause | 快照（Phase 1）→ 暂停 VM |
+| resume | 恢复 VM → 健康检查 |
+| destroy | 快照 → 停止路由 → 销毁 VM → 释放租约 |
 
-判定为跳过时：Phase 5 清单里 **不要** 默认部署 sandbox Deployment。
+规则：
 
----
+1. 健康检查失败时不自动销毁，保留现场供诊断。
+2. resume 失败时，按 Phase 1 恢复流程重建实例。
+3. 初始化只在 `config.yaml` 不存在时执行。已初始化的 home 不覆盖。空目录不能遮蔽镜像内的初始内容。
 
-## 2. 为何不采用 v1.0 RPC 方案
+## 3. 唤醒
 
-现码已经是「会话级执行环境」，不是无状态函数：
+- 请求到达暂停的 profile 时，网关保留该请求，触发 resume，等待健康检查通过后转发。
+- 等待上限可配置。超过上限返回"正在唤醒"（HTTP 202 或等价状态），由客户端重试。
+- Pocket 客户端在收到该状态时显示"正在唤醒"，不显示为连接失败。
+- 日程到点唤醒见 Phase 4。
 
-- `tools/environments/base.py`：每命令新进程，但 **cwd / env snapshot 按会话保留**。
-- docker / singularity：**bind mount** 看到同一工作区。
-- ssh / modal / daytona：`file_sync.py` 同步工作区。
-- `terminal(background=true, notify_on_complete=true)`、浏览器 CDP、委托子 agent 都绑在这个模型上。
+## 4. 路由
 
-v1.0「L0 `write_file` 在 gateway 本地、L2 `terminal` 在一次性容器」会拆掉文件连续性；「每请求起容器」会拆掉后台进程与 cwd。Agent 侧不可能「零感知」。Phase 1 又明确 **不同步工作区**，对象存储 mounts 并不存在。
+- 网关按 `profile_id` 找到当前实例，代理到 VM 的 api_server。
+- HTTP、SSE 流式输出、WebSocket（`/api/ws`）都要支持。WebSocket 升级前完成鉴权（Phase 2）。
+- 网关到 VM 使用**实例级内部密钥**。VM 只接受带有效内部密钥的请求。
+- 网关向 VM 传递已验证的主体信息（`profile_id`、`device_id` 或 `api_key_id`），由内部密钥签名。VM 不接收终端用户的原始凭证。
 
-Footprint：新能力应落在 environment 表上的新 provider，或运维强制已有 backend，而不是新核心 RPC 面。
+## 5. 挂载
 
----
+- 宿主目录路径由服务端根据 `profile_id` 派生，客户端不能指定。
+- `profile_id` 必须匹配白名单格式，拒绝路径分隔符与 `..`。
+- VM 内 Hermes 以非 root 用户运行。
+- `/opt/common-skills` 只读挂载。同名私有 Skill 优先。
 
-## 3. 若跳过：运维约定（仍写进总设计，避免空窗）
+## 6. 网络
 
-多副本 + 不可信租户时：
+- 默认拒绝出站。
+- 放行：模型端点（显式 CIDR 或域名）、模板声明的外部服务。
+- 屏蔽：内网网段（`10/8`、`172.16/12`、`192.168/16`）、云元数据地址、控制面、节点代理、Redis 或数据库、对象存储内网地址、其他 VM。
 
-1. 配置 `terminal.backend` 为 docker（或已有远程 backend），禁止默认 local 解析到 gateway 可写的宿主机盘。
-2. 继续用现有审批 / egress / seccomp 相关配置，不在本阶段发明平行策略语言。
-3. 文档告知：会话迁移后工作区不跟随（Phase 0）；要持久盘就用 backend 自己的 volume（docker volume、modal 盘等），不要指望 Phase 1 快照。
+## 7. 密钥
 
-无需新包、无新工具 schema、prompt 缓存不受影响。
+- 模型密钥与其他租户凭证在启动时注入 VM 环境变量。
+- 不写入挂载目录，不进入快照。
+- 轮换 = 重启实例。
 
-**跳过新增沙箱代码不等于跳过隔离验收。** 不可信多租户公网开放前必须用现有 backend 验证文件/终端共享正确隔离的工作区、浏览器/插件/委托与后台回调不越过租户边界，凭证和网络出口满足部署策略。仅设置 terminal.backend 不能自动证明全部工具都被隔离；不能满足的工具须按会话能力配置禁用，或另行实施 provider，不假称已完成多租户隔离。
+## 8. 资源与空闲
 
-持久 volume 必须按稳定 cluster profile/conversation 身份映射，节点本地 docker volume 并不自动跨节点可达。故障迁移只能承诺 backend 实际支持的状态恢复。
+- 模板声明 CPU、内存、磁盘上限，按 profile 可覆盖。
+- 空闲超过 `idle_pause_sec`（默认 900s）后自动 pause。
+- VM 内 terminal 使用 local backend。隔离由 VM 提供。
 
----
+## 9. 验收
 
-## 4. 若仍要做代码：唯一允许的形态
+1. **隔离**：租户 A 的 VM 无法访问控制面、节点代理、数据库、对象存储内网地址、其他 VM 或内网段。路径穿越和符号链接攻击被拒绝。
+2. **挂载**：空目录不遮蔽镜像初始内容；已初始化的 home 不被覆盖。
+3. **单 writer**：创建新实例前旧实例已停止。
+4. **密钥**：VM 文件系统与快照中搜不到明文密钥。
+5. **流式**：SSE 与 WebSocket 经网关代理后输出完整，客户端断开能传播到 VM。
+6. **唤醒**：暂停的 profile 收到请求后，唤醒完成并返回；唤醒耗时有记录。
+7. **工具连续性**：同一会话中 `write_file` 与 `terminal` 看到同一文件，后台任务能完成回调。
+8. **提供者边界**：核心仓库的代码中不出现 Cube SDK 的导入。
 
-目标：把「高危执行」关进 **已有 Environment ABC** 的一个更硬的 backend，工具注册与 `handle_function_call` 不变。
+## 10. 待确认
 
-### 允许
+- Cube provider 包的名称与仓库位置。
+- 目标 Cube 版本的 pause/resume 可靠性（Cube #953）。
+- 出站策略能否精确到 CIDR 与域名。
 
-- 新增 `tools/environments/` sibling（例如更严的 gVisor 包装），在 `terminal_tool_backends.py` **表驱动**登记。
-- `hermes tools` / `config.yaml` 的 `terminal.backend` 选出它。
-- 可选：`risk_level` **仅审计/审批**（不进模型 schema，以免破坏 prompt 缓存）。不作为执行路由分叉。
+## 11. 实施步骤
 
-### 禁止
-
-- 按工具名走 gRPC `ToolSandbox.Execute`。
-- 每 tool call 销毁容器导致 cwd/后台进程丢失。
-- 默认把第三方插件标 L2 并强制 RPC。
-- 为文件工具单独做对象存储 mount 协议（工作区同步不在 1–5 范围；backend 自己解决盘）。
-
-### 验收（仅当实施）
-
-- 同一会话连续 `write_file` + `terminal` 看到同一文件。
-- `terminal(background=true)` 仍能完成回调。
-- `cluster.enabled=false` 且 `terminal.backend=local` 时与今日完全一致。
-- 开关 backend 不改变工具 JSON schema。
-
----
-
-## 5. 配置（仅当实施）
-
-```yaml
-# 跳过 Phase 3 时不要增加新段；用现有 terminal.backend 即可。
-terminal:
-  backend: docker    # 多租户部署的运维强制项，不是新集群开关
-```
-
-不要引入与 `tools/environments` 平行的 `sandbox.enabled` + `sandbox.endpoint`，除非那个 endpoint 是 **environment provider** 的实现细节。
-
----
-
-## 6. 与其他阶段
-
-- Phase 1：工作区不同步 → 沙箱/backend 磁盘不能假设随会话亲和迁移，除非 backend 用共享 volume。
-- Phase 5：跳过则拓扑里没有 sandbox 集群；HPA 只扩 gateway。
-- 观测：若 backend 有额外进程，健康检查走现有 Docker/远端探针，不进 `coordination/`。
+| 步 | 内容 | 验证 |
+|---|---|---|
+| S1 | Provider 接口与开发 provider | 生命周期循环 |
+| S2 | 节点代理的目录准备与初始化 | 空目录不遮蔽镜像 |
+| S3 | 网关路由（HTTP、SSE、WebSocket） | 流式输出完整 |
+| S4 | 唤醒与"正在唤醒"状态 | 唤醒耗时记录 |
+| S5 | 网络与密钥（Cube 独立包） | 内网探测失败，无明文落盘 |
+| S6 | 隔离验收 | 第 9 节全部通过 |

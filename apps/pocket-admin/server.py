@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, SecretStr
 
 from hermes_constants import get_process_hermes_home
-from hermes_cli.dashboard_auth.pocket_store import PocketAuthority
+from hermes_cli.dashboard_auth.pocket_store import AUTHORITY_FILENAME, PocketAuthority
 
 COOKIE = "pocket_admin_session"
 SESSION_SECONDS = 3600
@@ -118,7 +118,7 @@ def create_app(home: Path, *, secure_cookies: bool = False) -> FastAPI:
     salt, expected = bytes.fromhex(record["salt"]), bytes.fromhex(record["digest"])
     if len(salt) != 16 or len(expected) != 64:
         raise ValueError("Invalid administrator password record")
-    authority = PocketAuthority(home / "pocket-auth.sqlite")
+    authority = PocketAuthority(home / AUTHORITY_FILENAME)
     sessions: dict[str, float] = {}
     attempts: deque[float] = deque()
     application = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)

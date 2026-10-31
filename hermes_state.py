@@ -50,7 +50,6 @@ from hermes_state_readpool import _READ_POOL_MAX, _proc_fd_targets, _read_budget
 from hermes_state_sessions import SessionSessionsMixin
 from hermes_state_fts import SessionFtsSetupMixin, load_fts5_cjk_extension
 from hermes_state_portability import SessionPortabilityMixin
-from hermes_state_replace import SessionReplaceMixin
 from hermes_state_telegram import SessionTelegramTopicsMixin
 from hermes_state_profile_repair import SessionProfileRepairMixin
 from hermes_state_schema import SessionSchemaMixin
@@ -451,7 +450,7 @@ def _foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
 
 class SessionDB(
     SessionSessionsMixin, SessionFtsSetupMixin, SessionSearchMixin, SessionSchemaMixin,
-    SessionPortabilityMixin, SessionReplaceMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
+    SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
     SessionGatewayMixin, SessionMaintenanceMixin, SessionUsageMixin, SessionTitlesMixin,
     SessionMessagesMixin, SessionRewindMixin, SessionProfileRepairMixin,
 ):

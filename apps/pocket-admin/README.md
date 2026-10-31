@@ -1,6 +1,6 @@
 # Pocket Admin
 
-独立管理项目，不包含 Pocket 客户端，不由 `hermes serve` 挂载。独立构建、进程和监听端口；通过同一个 `HERMES_HOME` 内的 `pocket-auth.sqlite` 与客户端服务共享单机授权状态。
+独立管理项目，不包含 Pocket 客户端，不由 `hermes serve` 挂载。独立构建、进程和监听端口；通过同一个 `HERMES_HOME` 内的 `pocket-auth.sqlite` 与客户端服务共享单机授权状态。该文件同时是控制面权威存储（`gateway/coordination`），管理后台与客户端都只经它读写授权状态；角色的会话、记忆、配置和日程位于角色 profile home 或角色 VM 内，管理后台不访问。
 
 从仓库根目录执行。首次使用先构建本地隔离环境和前端资源：
 

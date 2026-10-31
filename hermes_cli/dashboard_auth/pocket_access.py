@@ -28,8 +28,9 @@ _RPC_METHODS = frozenset({
 
 def authority() -> PocketAuthority:
     from hermes_cli.config import get_process_hermes_home
+    from hermes_cli.dashboard_auth.pocket_store import AUTHORITY_FILENAME
 
-    return PocketAuthority(Path(get_process_hermes_home()) / "pocket-auth.sqlite")
+    return PocketAuthority(Path(get_process_hermes_home()) / AUTHORITY_FILENAME)
 
 
 async def admit_http(request, call_next):

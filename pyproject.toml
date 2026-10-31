@@ -443,10 +443,9 @@ otlp = [
 ]
 langfuse = ["langfuse==4.15.2"]
 bedrock = ["boto3==1.42.89"]
-# Optional multi-replica api_server: Redis coordination, S3-compatible snapshots, zstd.
+# Control plane for sandbox hosting: S3-compatible snapshot objects, zstd compression.
 # Not in [all]. An enabled cluster refuses to start until this extra is installed.
 cluster = [
-  "redis>=5,<7",
   "boto3>=1.34,<2",
   "zstandard>=0.22,<0.24",
 ]

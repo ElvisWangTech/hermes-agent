@@ -2714,14 +2714,11 @@ DEFAULT_CONFIG = {
         # Extra ports detection probes for an external llama-server (besides 8080).
         "detect_ports": [],
     },
-    # Optional multi-replica api_server. Disabled matches today's single process.
-    # Secrets (REDIS_URL, CLUSTER_INTERNAL_TOKEN, object-store keys) stay in .env.
+    # Control plane for sandbox-per-profile hosting (docs/distributed Phase 1).
+    # Disabled matches today's single process. Object-store keys stay in .env.
     "cluster": {
         "enabled": False,
         "namespace": "",
-        "profile_id": "",
-        "node_id": "",
-        "advertise_url": "",
         "object_store": {
             "backend": "none",
             "endpoint": "",
@@ -2729,19 +2726,14 @@ DEFAULT_CONFIG = {
             "region": "us-east-1",
             "addressing_style": "path",
         },
-        "affinity": {
-            "lease_ttl_sec": 90,
-            "heartbeat_sec": 30,
+        "lease": {
+            "ttl_sec": 90,
         },
         "snapshot": {
-            "on_turn_end": True,
-            "dirty_periodic_sec": 300,
+            "interval_sec": 600,
+            "max_size_mb": 2048,
         },
         "drain_timeout_sec": 120,
-        "proxy": {
-            "timeout_sec": 600,
-            "allow_hosts": [],
-        },
     },
     "_config_version": 49,  # Config schema version - bump this when adding new required fields
 }
@@ -3212,12 +3204,6 @@ OPTIONAL_ENV_VARS = {
     "HERMES_EPHEMERAL_SYSTEM_PROMPT": _setting(
         "Ephemeral system prompt injected at API-call time (never persisted to sessions)",
         "Ephemeral system prompt", None),
-    "REDIS_URL": _setting(
-        "Redis URL for an enabled cluster (coordination and the conversation manifest)",
-        "Redis URL", None, password=True, advanced=True),
-    "CLUSTER_INTERNAL_TOKEN": _setting(
-        "Shared secret for cluster drain and the internal session proxy",
-        "Cluster internal token", None, password=True, advanced=True),
     "OBJECT_STORE_ACCESS_KEY": _setting(
         "Access key for the S3-compatible snapshot bucket",
         "Object store access key", None, password=True, advanced=True),

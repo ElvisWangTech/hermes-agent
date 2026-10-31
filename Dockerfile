@@ -270,7 +270,7 @@ FROM runtime_base AS python_deps
 # is baked so hosted/immutable images can enable the adapter without writing
 # the sealed venv.
 #
-# The [cluster] extra (Redis, boto3, zstd) is baked for the same reason: a
+# The [cluster] extra (boto3, zstd) is baked for the same reason: a
 # sealed image cannot lazy-install it, and an enabled cluster refuses to
 # start without those modules. It stays out of [all].
 #
