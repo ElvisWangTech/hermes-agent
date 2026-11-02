@@ -91,3 +91,58 @@ def manifest(
         instance_id=instance_id,
         created_at=created_at,
     )
+
+
+class FakeProvider:
+    """Records lifecycle calls. ``endpoint`` is what ``start`` returns."""
+
+    def __init__(self, endpoint: str = "http://instance.invalid"):
+        self.endpoint = endpoint
+        self.calls: list[tuple[str, str]] = []
+        self.started_env: dict[str, dict[str, str]] = {}
+
+    def start(self, instance_id, state_dir, env):
+        self.calls.append(("start", instance_id))
+        self.started_env[instance_id] = dict(env)
+        return self.endpoint
+
+    def pause(self, instance_id):
+        self.calls.append(("pause", instance_id))
+
+    def resume(self, instance_id):
+        self.calls.append(("resume", instance_id))
+
+    def stop(self, instance_id):
+        self.calls.append(("stop", instance_id))
+
+
+@pytest.fixture
+def provider():
+    return FakeProvider()
+
+
+@pytest.fixture
+def make_manager(env, provider):
+    """Build an InstanceManager over the shared fake clock, object store, and node root."""
+    from gateway.coordination.instances import InstanceManager
+
+    def build(*, idle_pause_sec: float = 60.0, prov=None):
+        prov = prov or provider
+        return InstanceManager(
+            provider=prov,
+            node_root=env.host.root,
+            make_service=lambda host: SnapshotService(
+                authority=env.authority,
+                objects=env.objects,
+                host=host,
+                namespace="lab",
+                lease_ttl=90,
+                max_bytes=1 << 20,
+                clock=env.clock,
+            ),
+            env_for=lambda profile: {"HERMES_HOME": str(env.host.root / profile)},
+            idle_pause_sec=idle_pause_sec,
+            clock=env.clock,
+        )
+
+    return build

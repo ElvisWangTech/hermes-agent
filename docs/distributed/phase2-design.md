@@ -92,3 +92,20 @@ Pocket 的多设备、连接码、主人认证与单机阶段的设计见 [Pocke
 
 - 本阶段不确定 Pocket 凭证的具体格式，只要求它满足 1.2 的约束。
 - 声纹验证不在本阶段。文字通道和设备凭证不能视为声纹验证通过。
+
+## 11. 实现状态（2026-10-31）
+
+`gateway/coordination/access.py`，表 `cp_api_keys`、`cp_usage` 位于 `pocket-auth.sqlite`。
+
+- API 密钥：仅存 HMAC-SHA256 摘要（pepper 由调用方提供，应来自 secret scope）；吊销即时生效。
+- 设备凭证：复用 `PocketAuthority.verify`，通过回调注入，不引入 dashboard 依赖。
+- 授权：`Principal` 绑定单一 profile；`authorize` 拒绝跨 profile。
+- 限流：凭证与 profile 两个令牌桶（进程内）。
+- 软配额：`preflight` 读取当日（UTC）已记账总量；`record_usage` 以 `execution_id` 去重。
+
+未实现：
+
+- 限流与配额的计数不跨进程共享，多副本前需换成托管存储。
+- 用量上报入口：VM 侧回报 `execution_id` 与 token 数的接口尚未定义，当前只能由调用方直接调用 `record_usage`。
+- `ratelimit.*` 与 `quota.*` 配置键尚未进入 `DEFAULT_CONFIG`，当前由构造参数传入。
+- 设计中的 `hk_` 密钥管理 CLI（`hermes keys create/revoke/list`）未实现。

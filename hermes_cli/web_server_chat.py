@@ -239,6 +239,17 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "device_denied", "device"
         ws._hermes_auth_identity = {**identity, "provider": "pocket", "credential": token}
         return None, "device"
+    from hermes_cli.dashboard_auth.pocket_access import cluster_identity
+    asserted = cluster_identity(
+        ws.headers.get("authorization", ""),
+        ws.headers.get("X-Hermes-Principal", ""),
+        ws.headers.get("X-Hermes-Cluster-Profile", ""),
+    )
+    if asserted is not None:
+        if ws.url.path != "/api/ws":
+            return "device_denied", "device"
+        ws._hermes_auth_identity = {**asserted, "credential": asserted["device_id"]}
+        return None, "device"
     auth_required = bool(getattr(app.state, "auth_required", False))
     if auth_required:
         # Lazy import — keeps this function importable in test harnesses

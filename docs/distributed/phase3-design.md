@@ -98,3 +98,20 @@
 | S4 | 唤醒与"正在唤醒"状态 | 唤醒耗时记录 |
 | S5 | 网络与密钥（Cube 独立包） | 内网探测失败，无明文落盘 |
 | S6 | 隔离验收 | 第 9 节全部通过 |
+
+## 12. 实现状态（2026-10-31）
+
+`gateway/coordination/instances.py`（生命周期）、`router.py`（路由）。Cube 实现在独立包中，不在本仓库。
+
+- `SandboxProvider` 协议：`start / pause / resume / stop`。提供方负责健康检查，`start` 返回可用的基础 URL。
+- `InstanceManager`：`ensure_running` 获取租约、恢复目录、以实例自己的密钥启动（注入为 `API_SERVER_KEY`）；`pause_idle` 先快照（不恢复）再暂停；`touch` 记录活动；`renew_leases` 续租，丢租约的实例被停止；`destroy` 先快照、失败则保留实例。
+- `Gateway.handle`：解析凭证 → 限流 → 检查 `X-Hermes-Profile` → 配额预检 → 唤醒或启动 → 转发。转发时去掉客户端凭证，改用实例密钥。
+- 代理：HTTP 与 SSE 流式转发，WebSocket 双向中继。
+
+未实现或未验证：
+
+- 真实 `hermes serve` 是否接受注入的 `API_SERVER_KEY` 访问 `/api/pocket/*` 与 `/api/ws`，需要在实际实例中验证。当前 Pocket 设备凭证由控制面签发，实例内的 `pocket_access` 只识别 `pd_` 令牌，两边的授权来源尚未对齐。
+- 实例的健康检查与就绪等待由提供方负责，管理器不做轮询。
+- 唤醒是同步等待，没有"正在唤醒"的排队或 202 应答。
+- `pause_idle` 与 `renew_leases` 需要由外部定时器调用，本仓库还没有控制面的调度循环。
+- 单节点内存态：实例表在进程内，控制面重启后依赖租约到期接管，尚未实现重新发现。

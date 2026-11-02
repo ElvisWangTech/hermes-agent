@@ -93,3 +93,18 @@ cluster:
 | S3 | 未听结果与送达规则 | 第 8 节第 4、5、6 条 |
 | S4 | 上限、暂停、销毁与停用 | 第 8 节第 3、7 条 |
 | S5 | 指标与配置门 | 默认无用户标签 |
+
+## 10. 实现状态（2026-10-31）
+
+`gateway/coordination/schedule.py`。
+
+- `FileScheduleSource`：只读取各 profile 节点目录下的 `cron/jobs.json`，筛出已启用且 `next_run_at` 已到期的任务。
+- `OccurrenceLedger`：在唤醒前原子认领 `(profile, job, scheduled_instant)`，同一次到期只认领一次；控制面重启时把遗留的 `claimed` 标为 `interrupted`，不重试。
+- `WakeScheduler.tick`：认领后调用 `InstanceManager.ensure_running`，成功记为 `woken`，失败记为 `failed`。它只负责唤醒，任务本身由实例内的 cron 调度器执行，并依靠其自身的账本防止重复触发。
+
+未实现：
+
+- 控制面的周期调度循环（tick 需要外部定时器）。
+- 失败的唤醒在补跑窗口内的重试（当前失败即结束）。
+- 未听结果的送达与日程界面的接线（属于 `apps/pocket` 与 Pocket 日程模块，本阶段不改）。
+- 依赖实例内 cron 账本的"唤醒后即执行"尚未在真实实例上验证。

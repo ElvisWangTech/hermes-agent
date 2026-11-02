@@ -1,5 +1,19 @@
-"""Profile-bound admission for Pocket at the shared HTTP and RPC boundaries."""
+"""Profile-bound admission for Pocket at the shared HTTP and RPC boundaries.
 
+Cluster mode: a sandbox instance launched by the control plane trusts the
+principal the cluster gateway injects. The proof of trust is the request
+carrying the instance's own internal key (``API_SERVER_KEY``) — only the
+gateway holds it — so the ``X-Hermes-Principal`` /
+``X-Hermes-Cluster-Profile`` headers it sends alongside are the identity, and
+no device row is consulted locally. Revocation stays authoritative at the
+gateway, which re-verifies every connection it accepts.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import os
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode
 
@@ -33,6 +47,38 @@ def authority() -> PocketAuthority:
     return PocketAuthority(Path(get_process_hermes_home()) / AUTHORITY_FILENAME)
 
 
+_PRINCIPAL_HEADER = "X-Hermes-Principal"
+_PROFILE_HEADER = "X-Hermes-Cluster-Profile"
+
+
+def cluster_identity(authorization: str, principal: str, profile: str) -> dict | None:
+    """The gateway-asserted device identity, or None when this request is not
+    a cluster-routed one (the internal key is absent locally, or mismatched)."""
+    internal_key = os.environ.get("API_SERVER_KEY", "")
+    if not internal_key:
+        return None
+    if not hmac.compare_digest(authorization.encode(), f"Bearer {internal_key}".encode()):
+        return None
+    kind, _, device_id = principal.partition(":")
+    if kind != "device" or not device_id or not profile:
+        return None
+    return {
+        "profile": profile,
+        "profile_id": profile,
+        "device_id": device_id,
+        "provider": "pocket",
+        "cluster": True,
+    }
+
+
+def cluster_http_identity(request) -> dict | None:
+    return cluster_identity(
+        request.headers.get("authorization", ""),
+        request.headers.get(_PRINCIPAL_HEADER, ""),
+        request.headers.get(_PROFILE_HEADER, ""),
+    )
+
+
 async def admit_http(request, call_next):
     token = request.headers.get("X-Hermes-Session-Token", "")
     bearer = request.headers.get("authorization", "")
@@ -41,18 +87,29 @@ async def admit_http(request, call_next):
     if request.url.path == "/api/pocket/exchange" and request.method == "POST":
         request.state.token_authenticated = True
         return await call_next(request)
-    if not token.startswith("pd_"):
-        return None
-    identity = authority().verify(token)
+    identity = None
+    if token.startswith("pd_"):
+        identity = authority().verify(token)
+        if identity is None:
+            return JSONResponse({"detail": "Device credential is invalid or revoked"}, status_code=401)
+    else:
+        # Cluster-managed instance: the gateway asserted the device with the
+        # internal key. No local authority consult and no revocation re-check —
+        # the gateway re-verifies everything it routes.
+        identity = cluster_http_identity(request)
     if identity is None:
-        return JSONResponse({"detail": "Device credential is invalid or revoked"}, status_code=401)
+        return None
     if _HTTP_METHODS.get(request.url.path) != request.method:
         return JSONResponse({"detail": "Device credential cannot access this endpoint"}, status_code=403)
     requested = request.query_params.getlist("profile")
     if requested and requested != [identity["profile"]]:
         return JSONResponse({"detail": "Profile access denied"}, status_code=403)
     query = [(key, value) for key, value in parse_qsl(request.scope["query_string"].decode()) if key != "profile"]
-    query.append(("profile", identity["profile"]))
+    if not identity.get("cluster"):
+        # A cluster instance serves exactly one profile: its own home. Naming that
+        # profile would send the dashboard looking for a profile directory that a
+        # sandbox does not have.
+        query.append(("profile", identity["profile"]))
     request.scope["query_string"] = urlencode(query).encode()
     request.state.pocket_identity = identity
     request.state.token_authenticated = True
@@ -63,9 +120,13 @@ def admit_rpc(req: dict, transport, server) -> dict:
     identity = getattr(transport, "auth_identity", None) or {}
     if identity.get("provider") != "pocket":
         return req
-    current = authority().verify(identity["credential"])
-    if current is None:
-        raise PermissionError("Device credential is revoked")
+    if not identity.get("cluster"):
+        # Local device: re-verify against this instance's authority on every
+        # call. Cluster identities are verified by the gateway that routed them.
+        current = authority().verify(identity["credential"])
+        if current is None:
+            raise PermissionError("Device credential is revoked")
+        identity = {**identity, **current}
     if not isinstance(req, dict):
         raise PermissionError("Invalid device request")
     if "method" not in req:
@@ -84,7 +145,7 @@ def admit_rpc(req: dict, transport, server) -> dict:
     if not isinstance(params, dict):
         raise PermissionError("Invalid device request")
     params = dict(params)
-    profile = current["profile"]
+    profile = identity["profile"]
     if "profile" in params and params["profile"] != profile:
         raise PermissionError("Profile access denied")
     session_id = params.get("session_id")
@@ -112,7 +173,10 @@ def admit_rpc(req: dict, transport, server) -> dict:
                 if database is None or database.get_session(session_id) is None:
                     raise PermissionError("Session access denied")
     if method in {"session.create", "session.resume", "session.list"}:
-        params["profile"] = profile
+        if identity.get("cluster"):
+            params.pop("profile", None)
+        else:
+            params["profile"] = profile
     if method == "session.create":
         allowed = {"source", "title", "profile"}
         if set(params) - allowed:
@@ -125,8 +189,7 @@ def admit_output(frame: dict, transport) -> bool:
     identity = getattr(transport, "auth_identity", None) or {}
     if identity.get("provider") != "pocket":
         return True
-    current = authority().verify(identity["credential"])
-    if current is None:
+    if not identity.get("cluster") and authority().verify(identity["credential"]) is None:
         return False
     if "method" not in frame:
         return True

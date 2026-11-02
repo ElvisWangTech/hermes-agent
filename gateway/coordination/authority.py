@@ -29,6 +29,29 @@ CREATE TABLE IF NOT EXISTS cp_instances (
     lease_expires REAL NOT NULL,
     dirty INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS cp_api_keys (
+    key_id TEXT PRIMARY KEY,
+    digest TEXT NOT NULL UNIQUE,
+    profile_id TEXT NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cp_usage (
+    execution_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    day TEXT NOT NULL,
+    tokens INTEGER NOT NULL,
+    recorded_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS cp_usage_profile_day ON cp_usage(profile_id, day);
+CREATE TABLE IF NOT EXISTS cp_occurrences (
+    profile_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    scheduled_instant TEXT NOT NULL,
+    status TEXT NOT NULL,
+    claimed_at REAL NOT NULL,
+    PRIMARY KEY (profile_id, job_id, scheduled_instant)
+);
 CREATE TABLE IF NOT EXISTS cp_manifests (
     profile_id TEXT PRIMARY KEY,
     revision INTEGER NOT NULL,
@@ -76,12 +99,12 @@ class ControlPlaneAuthority:
         self.path = path
         self._clock = clock
         path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as database:
+        with self.connect() as database:
             database.executescript(_SCHEMA)
         path.chmod(0o600)
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def connect(self) -> Iterator[sqlite3.Connection]:
         database = sqlite3.connect(self.path, timeout=10, isolation_level=None)
         database.row_factory = sqlite3.Row
         try:
@@ -90,8 +113,8 @@ class ControlPlaneAuthority:
             database.close()
 
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
-        with self._connect() as database:
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        with self.connect() as database:
             database.execute("BEGIN IMMEDIATE")
             try:
                 yield database
@@ -104,7 +127,7 @@ class ControlPlaneAuthority:
         """Take the profile's lease. Refused while another incarnation's lease is live."""
         now = self._clock()
         lease = Lease(profile_id, instance_id, secrets.token_hex(16))
-        with self._transaction() as database:
+        with self.transaction() as database:
             row = database.execute(
                 "SELECT lease_expires FROM cp_instances WHERE profile_id = ?",
                 (profile_id,),
@@ -130,7 +153,7 @@ class ControlPlaneAuthority:
     def renew(self, lease: Lease, ttl: float) -> bool:
         """Extend a live lease. An expired lease is never revived: its holder must stop."""
         now = self._clock()
-        with self._transaction() as database:
+        with self.transaction() as database:
             cursor = database.execute(
                 """
                 UPDATE cp_instances SET lease_expires = ?
@@ -141,18 +164,18 @@ class ControlPlaneAuthority:
             return cursor.rowcount == 1
 
     def release(self, lease: Lease) -> None:
-        with self._transaction() as database:
+        with self.transaction() as database:
             database.execute(
                 "UPDATE cp_instances SET lease_expires = 0 WHERE profile_id = ? AND incarnation = ?",
                 (lease.profile_id, lease.incarnation),
             )
 
     def require(self, lease: Lease) -> None:
-        with self._connect() as database:
+        with self.connect() as database:
             _require_live(database, lease, self._clock())
 
     def mark_dirty(self, lease: Lease) -> None:
-        with self._transaction() as database:
+        with self.transaction() as database:
             _require_live(database, lease, self._clock())
             database.execute(
                 "UPDATE cp_instances SET dirty = 1 WHERE profile_id = ?",
@@ -160,7 +183,7 @@ class ControlPlaneAuthority:
             )
 
     def instance_state(self, profile_id: str) -> InstanceState | None:
-        with self._connect() as database:
+        with self.connect() as database:
             row = database.execute(
                 "SELECT instance_id, incarnation, lease_expires, dirty FROM cp_instances WHERE profile_id = ?",
                 (profile_id,),
@@ -175,7 +198,7 @@ class ControlPlaneAuthority:
         )
 
     def read_manifest(self, profile_id: str) -> Manifest | None:
-        with self._connect() as database:
+        with self.connect() as database:
             row = database.execute(
                 "SELECT * FROM cp_manifests WHERE profile_id = ?", (profile_id,)
             ).fetchone()
@@ -192,7 +215,7 @@ class ControlPlaneAuthority:
             raise SnapshotError(
                 "manifest does not extend the revision it was built from"
             )
-        with self._transaction() as database:
+        with self.transaction() as database:
             _require_live(database, lease, self._clock())
             row = database.execute(
                 "SELECT revision FROM cp_manifests WHERE profile_id = ?",

@@ -1,0 +1,56 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# Sandbox API key handoff (Cube sandbox image).
+#
+# The control plane sets API_SERVER_KEY through CubeAPI envVars. Those reach envd,
+# not the container's process environment, so the profile gateway (gateway-default,
+# started by 02-reconcile-profiles) never sees them. This service runs as root:
+#   1. read the key from envd on loopback (it is not reachable from outside the VM);
+#   2. publish it to the s6 container environment, which lives on tmpfs and is what
+#      gateway-default's with-contenv run script loads (never written to the data volume);
+#   3. drop the API_SERVER_KEY line stage2 generates into $HERMES_HOME/.env, which
+#      would otherwise override the environment at runtime;
+#   4. restart gateway-default and dashboard so they start with the key.
+set -eu
+
+home="${HERMES_HOME:-/opt/data}"
+python="${HERMES_PYTHON:-python3}"
+
+key=""
+tries=0
+while [ "$tries" -lt 600 ]; do
+    key=$("$python" -c 'import json, urllib.request as u; print(json.load(u.urlopen("http://127.0.0.1:49983/envs", timeout=2)).get("API_SERVER_KEY", ""))' 2>/dev/null || true)
+    [ -n "$key" ] && break
+    tries=$((tries + 1))
+    sleep 1
+done
+if [ -z "$key" ]; then
+    echo "sandbox-key: API_SERVER_KEY was not provided through sandbox envVars" >&2
+    exit 1
+fi
+
+umask 077
+printf '%s' "$key" > /run/s6/container_environment/API_SERVER_KEY
+# The dashboard binds a non-loopback address, so it refuses to start without an auth
+# provider. Its basic-auth password is the same internal key: whoever holds it already
+# reaches this instance, so no second secret is introduced.
+printf '%s' "cluster" > /run/s6/container_environment/HERMES_DASHBOARD_BASIC_AUTH_USERNAME
+printf '%s' "$key" > /run/s6/container_environment/HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
+
+if [ -f "$home/.env" ]; then
+    sed -i '/^API_SERVER_KEY=/d' "$home/.env"
+fi
+
+# Both the profile gateway (api_server, /v1) and the dashboard (Pocket, /api/ws) verify
+# the internal key, so both restart. `-r` only restarts a running service; down-then-up
+# starts each in any state.
+for service in gateway-default dashboard; do
+    while [ ! -d "/run/service/$service" ]; do
+        sleep 1
+    done
+    /command/s6-svc -d "/run/service/$service" || true
+    sleep 2
+    /command/s6-svc -u "/run/service/$service"
+done
+
+exec sleep infinity
