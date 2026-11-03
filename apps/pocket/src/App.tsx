@@ -8,10 +8,11 @@ import { Name } from './screens/Name'
 import { Pick } from './screens/Pick'
 import { clearPocketStorage, savedRoles, saveProfile, switchRole } from './storage'
 import { findCharacter } from './characters'
+import { newId } from './storage'
 
 export function App({ profile: initial }: { profile: PocketProfile }) {
   const [profile, setProfile] = useState<PocketProfile>(() => {
-    const next = { ...initial, localId: initial.localId || crypto.randomUUID() }
+    const next = { ...initial, localId: initial.localId || newId() }
     saveProfile(next)
     return next
   })
@@ -54,7 +55,7 @@ export function App({ profile: initial }: { profile: PocketProfile }) {
       </div>
       <button type="button" onClick={() => {
         setPrevious(profile)
-        select({ localId: crypto.randomUUID(), token: '', characterId: '', name: '' })
+        select({ localId: newId(), token: '', characterId: '', name: '' })
         setAdding(true)
       }}>添加角色</button>
     </main>
@@ -93,7 +94,7 @@ export function App({ profile: initial }: { profile: PocketProfile }) {
       onDestroy={async () => {
         await disconnectDevice(profile.token)
         clearPocketStorage()
-        save({ localId: crypto.randomUUID(), token: '', characterId: '', name: '' })
+        save({ localId: newId(), token: '', characterId: '', name: '' })
       }}
     />
   )
