@@ -138,7 +138,29 @@ class PocketAuthority:
         return row["profile"] if row else None
 
     def disable_role(self, profile_id: str) -> None:
+        """``profile_id`` accepts the role's internal id (single-machine callers)
+        or the profile name (cluster callers); both name the same role row."""
         with self._connect() as database:
-            database.execute("UPDATE pocket_roles SET active = 0 WHERE id = ?", (profile_id,))
-            database.execute("UPDATE pocket_devices SET revoked = 1 WHERE role_id = ?", (profile_id,))
-            database.execute("UPDATE pocket_codes SET used = 1 WHERE role_id = ?", (profile_id,))
+            database.execute(
+                "UPDATE pocket_roles SET active = 0 WHERE id = ?", (profile_id,)
+            )
+            database.execute(
+                "UPDATE pocket_devices SET revoked = 1 WHERE role_id IN "
+                "(SELECT id FROM pocket_roles WHERE id = ? OR profile = ?)",
+                (profile_id, profile_id),
+            )
+            database.execute(
+                "UPDATE pocket_codes SET used = 1 WHERE role_id IN "
+                "(SELECT id FROM pocket_roles WHERE id = ? OR profile = ?)",
+                (profile_id, profile_id),
+            )
+
+    def enable_role(self, profile_id: str) -> None:
+        """Re-activate a disabled role (id or profile name). Revoked devices and
+        codes stay revoked; the recovery path for users is a fresh code."""
+        with self._connect() as database:
+            database.execute(
+                "UPDATE pocket_roles SET active = 1 WHERE id = ? "
+                "OR profile = ?",
+                (profile_id, profile_id),
+            )

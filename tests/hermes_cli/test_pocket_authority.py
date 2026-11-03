@@ -205,3 +205,26 @@ def test_device_ws_upgrade_and_existing_transport_revocation(tmp_path, monkeypat
     assert not pocket_access.admit_output({"id": 1, "result": {}}, transport)
     with pytest.raises(PermissionError):
         pocket_access.admit_rpc({"id": 2, "method": "client.capabilities", "params": {}}, transport, None)
+
+def test_disable_and_enable_accept_the_profile_name_the_cluster_sends(tmp_path):
+    """Modelled on revoke_device's dual addressing: the cluster passes profile
+    NAMES; a disable addressed that way must cascade to every device and code
+    of the role, and re-enable only re-opens code issuance (revoked devices and
+    codes stay revoked — the recovery path is a fresh code)."""
+    from hermes_cli.dashboard_auth.pocket_store import PocketAuthority
+
+    authority = PocketAuthority(tmp_path / "auth.sqlite")
+    device = authority.exchange(authority.issue_code("role-a")["code"])
+    unused_code = authority.issue_code("role-a")["code"]
+
+    authority.disable_role("role-a")  # profile NAME, not the internal id
+
+    assert authority.verify(device["token"]) is None
+    with pytest.raises(ValueError):
+        authority.exchange(unused_code)
+
+    authority.enable_role("role-a")
+
+    fresh = authority.issue_code("role-a")["code"]
+    assert authority.exchange(fresh)["profile_id"] == device["profile_id"]
+    assert authority.verify(device["token"]) is None  # old device stays revoked
