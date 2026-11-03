@@ -70,14 +70,28 @@ class ClusterServer:
 
         try:
             root = Path(self._static_root).resolve()
-            path = (root / request.path.lstrip("/")).resolve()
-            if path.is_dir():
-                path = path / "index.html"
-            if not path.is_relative_to(root) or not path.is_file():
-                return None
-            return web.FileResponse(path, status=200)
+            for name in self._static_names(request.path):
+                path = (root / name).resolve()
+                if path.is_dir():
+                    path = path / "index.html"
+                if path.is_relative_to(root) and path.is_file():
+                    return web.FileResponse(path, status=200)
+            return None
         except (OSError, ValueError):
             return None
+
+    @staticmethod
+    def _static_names(path: str) -> list[str]:
+        """Filesystem candidates for a URL: the literal path first, then — when
+        the URL carries the client's ``/pocket/`` prefix — the same file in the
+        flat build output. The client references its assets as ``/pocket/...``
+        (vite base) while its dist is deployed at the static root itself; a
+        literal-only match leaves every subresource falling through to the
+        authenticated catch-all, which blanks the page."""
+        literal = path.lstrip("/")
+        if path.startswith("/pocket/"):
+            return [literal, literal[len("pocket/"):]]
+        return [literal]
 
     async def _exchange(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()

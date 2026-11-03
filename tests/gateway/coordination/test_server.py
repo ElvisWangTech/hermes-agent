@@ -144,3 +144,41 @@ async def test_static_hosting_is_optional(tmp_path, make_cluster):
         assert "portrait" in (await response.text())
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_pocket_prefixed_assets_resolve_into_the_flat_dist(tmp_path, make_cluster):
+    """The client HTML references assets as ``/pocket/assets/<hash>.js`` (vite
+    base) while the deployed dist is flat. If the prefix is not stripped, every
+    subresource falls to the authenticated catch-all and the page renders
+    blank — which is exactly what a browser user saw on the node."""
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "index-abc.js").write_text("console.log(1)")
+    (tmp_path / "manifest.webmanifest").write_text("{}")
+    server = TestServer(make_cluster(static_root=str(tmp_path)))
+    await server.start_server()
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        for url in ("/pocket/assets/index-abc.js", "/pocket/manifest.webmanifest"):
+            response = await client.get(url)
+            assert response.status == 200, url
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_pocket_prefix_without_a_file_never_becomes_a_static_hit(tmp_path, make_cluster):
+    """Prefix stripping is a map, not a sitemap: a URL with no backing file
+    must still fall through to the router (which 401s unauthenticated)."""
+    (tmp_path / "index.html").write_text("<html>portrait</html>")
+    server = TestServer(make_cluster(static_root=str(tmp_path)))
+    await server.start_server()
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        response = await client.get("/pocket/no-such-bundle.js")
+        assert response.status == 401
+    finally:
+        await client.close()
