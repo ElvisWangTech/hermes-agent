@@ -133,6 +133,9 @@ def _with_secrets(cfg, file_values: dict[str, str]):
 
 
 def main(argv: list[str] | None = None) -> int:
+    import logging
+
+    logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(description="Hermes cluster gateway")
     parser.add_argument("--home", required=True, help="control-plane HERMES_HOME")
     parser.add_argument("--node-root", required=True, help="host directory holding profile homes")

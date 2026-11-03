@@ -126,6 +126,24 @@ def test_local_identity_still_reverifies_against_the_authority(rpc_spy, monkeypa
     assert pocket_access.admit_output({"id": 1, "result": {}}, transport) is False
 
 
+def test_revocation_accepts_the_profile_name_the_cluster_sends(rpc_spy, monkeypatch, tmp_path):
+    """The cluster gateway routes with the profile NAME; a revoke addressed that
+    way must still land (the single-machine path passes the role's internal id)."""
+    from hermes_cli.dashboard_auth import pocket_access
+    from hermes_cli.dashboard_auth.pocket_store import PocketAuthority
+
+    authority = PocketAuthority(tmp_path / "auth.sqlite")
+    monkeypatch.setattr(pocket_access, "authority", lambda: authority)
+    device = authority.exchange(authority.issue_code("role-a")["code"])
+    identity = {**authority.verify(device["token"]), "provider": "pocket",
+                "credential": device["token"]}
+    transport = SimpleNamespace(auth_identity=identity)
+
+    assert pocket_access.admit_output({"id": 1, "result": {}}, transport) is True
+    authority.revoke_device(device["device_id"], "role-a")
+    assert pocket_access.admit_output({"id": 1, "result": {}}, transport) is False
+
+
 @pytest.fixture
 def rpc_spy(tmp_path):
     """A stand-in server exposing only the attributes admit_rpc touches."""

@@ -92,3 +92,57 @@ def test_snapshot_failure_keeps_the_instance_and_does_not_destroy(
 
     assert manager.instance("role-a") is not None
     assert ("stop", instance.instance_id) not in provider.calls
+
+
+def test_a_sandbox_killed_out_of_band_is_recycled(env, provider, make_manager):
+    """An out-of-band kill (node reboot, manual sandbox delete) leaves the manager
+    pointing at a dead sandbox id; once the instance is past its boot grace the
+    next request must stop it, release its lease, and boot a fresh instance
+    instead of relaying into 40x forever. A sandbox still inside the grace is
+    never probed: the cold gateway answers later than the envd the provider waits for."""
+    healthy: list[bool] = [True]
+    manager = make_manager(alive=lambda instance: healthy[0])
+    dead = manager.ensure_running("role-a")
+
+    assert manager.ensure_running("role-a") is dead  # inside the boot grace: no probe
+
+    env.clock.now += 601.0
+    healthy[0] = False
+    replacement = manager.ensure_running("role-a")
+
+    assert replacement.instance_id != dead.instance_id
+    assert ("stop", dead.instance_id) in provider.calls
+    assert ("start", replacement.instance_id) in provider.calls
+    assert manager.instance("role-a") is replacement
+
+
+def test_an_instance_paused_whose_sandbox_died_is_recycled(env, provider, make_manager):
+    """A pause hibernates the sandbox; if it dies while paused the wake-up must
+    not 500 on the provider error — it recycles and starts a fresh instance."""
+    manager = make_manager()  # default alive: everything answers /health
+    manager.ensure_running("role-a")
+    instance = manager.instance("role-a")
+    instance.state = "paused"
+
+    def broken_resume(instance_id):
+        provider.calls.append(("resume", instance_id))
+        raise RuntimeError("sandbox gone")
+
+    provider.resume = broken_resume
+    replacement = manager.ensure_running("role-a")
+
+    assert replacement.instance_id != instance.instance_id
+    assert ("stop", instance.instance_id) in provider.calls
+    assert ("start", replacement.instance_id) in provider.calls
+
+
+def test_a_paused_instance_is_never_probed(env, provider, make_manager):
+    """The heartbeat must not kill a hibernating instance: a paused sandbox
+    answers no /health yet is perfectly healthy."""
+    manager = make_manager(alive=lambda instance: False)  # every probe reports dead
+    instance = manager.ensure_running("role-a")
+    instance.state = "paused"
+
+    assert manager.renew_leases() == []
+    assert ("stop", instance.instance_id) not in provider.calls
+    assert manager.instance("role-a") is instance

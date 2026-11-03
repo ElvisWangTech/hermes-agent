@@ -126,7 +126,7 @@ def make_manager(env, provider):
     """Build an InstanceManager over the shared fake clock, object store, and node root."""
     from gateway.coordination.instances import InstanceManager
 
-    def build(*, idle_pause_sec: float = 60.0, prov=None):
+    def build(*, idle_pause_sec: float = 60.0, prov=None, alive=None):
         prov = prov or provider
         return InstanceManager(
             provider=prov,
@@ -143,6 +143,8 @@ def make_manager(env, provider):
             env_for=lambda profile: {"HERMES_HOME": str(env.host.root / profile)},
             idle_pause_sec=idle_pause_sec,
             clock=env.clock,
+            # Fake endpoints have no /health; tests opt into staleness explicitly.
+            alive=alive or (lambda instance: True),
         )
 
     return build

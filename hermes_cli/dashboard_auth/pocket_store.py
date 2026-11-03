@@ -117,10 +117,17 @@ class PocketAuthority:
             ).rowcount > 0
 
     def revoke_device(self, device_id: str, profile_id: str) -> None:
+        """``profile_id`` accepts the role's internal id (single-machine callers)
+        or the profile name (cluster callers); both name the same role row."""
         with self._connect() as database:
             database.execute(
-                "UPDATE pocket_devices SET revoked = 1 WHERE id = ? AND role_id = ?",
-                (device_id, profile_id),
+                """
+                UPDATE pocket_devices SET revoked = 1
+                WHERE id = ? AND role_id IN (
+                    SELECT id FROM pocket_roles WHERE id = ? OR profile = ?
+                )
+                """,
+                (device_id, profile_id, profile_id),
             )
 
     def role_profile(self, profile_id: str) -> str | None:

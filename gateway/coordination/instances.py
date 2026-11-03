@@ -22,6 +22,8 @@ from gateway.coordination.authority import Lease
 from gateway.coordination.errors import ClusterError, LeaseError
 from gateway.coordination.snapshots import SnapshotService
 
+BOOT_GRACE_SEC = 300.0  # a cold sandbox boots envd first; the gateway answers some 40-75s later
+
 
 @dataclass(frozen=True)
 class Started:
@@ -63,6 +65,7 @@ class Instance:
     last_active: float = 0.0
     host_header: str = ""  # the profile's dashboard port: Pocket and the web API
     api_host_header: str = ""  # the OpenAI-compatible api_server port (/v1 only)
+    started_at: float = 0.0  # boot-grace anchor: probes wait out the cold start
 
 
 @dataclass
@@ -95,6 +98,7 @@ class InstanceManager:
         env_for: Callable[[str], dict[str, str]],
         idle_pause_sec: float,
         clock: Callable[[], float] = time.time,
+        alive: "Callable[[Instance], bool] | None" = None,
     ):
         self._provider = provider
         self._host = _ProviderHost(provider, node_root)
@@ -102,6 +106,7 @@ class InstanceManager:
         self._env_for = env_for
         self._idle = idle_pause_sec
         self._clock = clock
+        self._alive = alive or _probe_alive
         self._instances: dict[str, Instance] = {}
 
     @property
@@ -114,10 +119,31 @@ class InstanceManager:
     def ensure_running(self, profile_id: str) -> Instance:
         """Return a running instance for the profile, starting or waking it as needed."""
         current = self._instances.get(profile_id)
-        if current is not None:
-            if current.state == "paused":
+        if current is not None and current.state == "paused":
+            try:
                 self._provider.resume(current.instance_id)
+            except Exception:
+                # Resume failing (sandbox deleted while paused, bad snapshot) is
+                # recovered the same way as an out-of-band kill: clean up and
+                # fall through to a fresh start instead of failing the request.
+                self._provider.stop(current.instance_id)
+                self._service.release(current.lease)
+                current = None
+            else:
                 current.state = "running"
+                current.last_active = self._clock()
+                return current
+        if current is not None and self._aged(current) and not self._alive(current):
+            # A sandbox that died out of band (node reboot, manual DELETE) leaves the
+            # record pointing at a dead sandbox id and every request would 40x through
+            # the proxy. A freshly started sandbox gets a boot grace — the provider only
+            # waits for the envd, the gateway answers after — but once aged and
+            # unresponsive it is cleaned up and started again.
+            self._provider.stop(current.instance_id)
+            self._service.release(current.lease)
+            del self._instances[profile_id]
+            current = None
+        if current is not None:
             current.last_active = self._clock()
             return current
         instance_id = f"{profile_id}-{secrets.token_hex(6)}"
@@ -142,6 +168,7 @@ class InstanceManager:
             self._clock(),
             started.host_header,
             api_host_header=started.api_host_header,
+            started_at=self._clock(),
         )
         self._instances[profile_id] = instance
         return instance
@@ -175,14 +202,28 @@ class InstanceManager:
         return paused
 
     def renew_leases(self) -> list[str]:
-        """Renew every lease. An instance that lost its lease is stopped and forgotten."""
+        """Renew every lease and probe the running sandboxes: an expired lease or a
+        sandbox that died out of band (node reboot, manual DELETE) is stopped and
+        forgotten. Paused instances skip the probe — a hibernating sandbox answers
+        no /health, and its wake-up path recovers a bad resume on its own."""
         lost: list[str] = []
         for profile_id, instance in list(self._instances.items()):
-            if not self._service.renew(instance.lease):
+            dead = not self._service.renew(instance.lease) or (
+                instance.state == "running"
+                and self._aged(instance)
+                and not self._alive(instance)
+            )
+            if dead:
                 self._provider.stop(instance.instance_id)
+                self._service.release(instance.lease)
                 del self._instances[profile_id]
                 lost.append(profile_id)
         return lost
+
+    def _aged(self, instance: Instance) -> bool:
+        """Past the boot grace: long enough that an unresponsive sandbox is dead,
+        not cold-starting (the provider waits only for the envd, not the gateway)."""
+        return self._clock() - instance.started_at > BOOT_GRACE_SEC
 
     def destroy(self, profile_id: str) -> None:
         """Commit the final state, then stop and release. A failed snapshot keeps the instance."""
@@ -216,3 +257,24 @@ def _as_started(result: "str | object") -> Started:
         getattr(result, "host_header", "") or "",
         getattr(result, "api_host_header", "") or "",
     )
+
+
+def _probe_alive(instance: Instance) -> bool:
+    """Health-check the running sandbox through the data plane.
+
+    The api_server's ``/health`` is unauthenticated by design, so one GET answers
+    "is this sandbox really up" with no key in the request. Any error status,
+    connection failure or timeout means the id is dead from the client's point of
+    view, which is what the router would learn one relay attempt later anyway.
+    """
+    import urllib.request
+
+    request = urllib.request.Request(
+        instance.endpoint.rstrip("/") + "/health",
+        headers={"Host": instance.api_host_header},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=4) as response:
+            return response.status == 200
+    except Exception:
+        return False
