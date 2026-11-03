@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from contextlib import contextmanager
 import getpass
 import hashlib
 import hmac
@@ -12,6 +13,8 @@ import os
 from pathlib import Path
 import secrets
 import time
+import urllib.request
+from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -23,6 +26,40 @@ from hermes_cli.dashboard_auth.pocket_store import AUTHORITY_FILENAME, PocketAut
 
 COOKIE = "pocket_admin_session"
 SESSION_SECONDS = 3600
+_cluster: "ClusterHomes | None" = None
+
+
+class ClusterHomes:
+    """Cluster profile source. Roles come from the control plane's authority, a
+    profile's home is ``root/<profile>`` (the directory the sandbox mounts), and the
+    edit window is read from the sandbox state, never from local profile dirs."""
+
+    def __init__(self, authority: PocketAuthority, root: Path, sandbox_states: Callable[[], dict[str, str]]):
+        self.authority = authority
+        self.root = root
+        self.sandbox_states = sandbox_states
+
+    def roles(self) -> list[str]:
+        return [row["profile"] for row in self.authority.management_snapshot()["roles"]]
+
+    def home(self, profile: str) -> Path:
+        return self.root / profile
+
+
+def cube_sandbox_states(api_url: str) -> dict[str, str]:
+    """Sandbox state per profile from the Cube API. An unreachable API raises, so
+    every edit is refused: the edit window fails closed."""
+    try:
+        with urllib.request.urlopen(api_url.rstrip("/") + "/sandboxes", timeout=10) as response:
+            boxes = json.loads(response.read() or b"[]")
+    except OSError as failure:
+        raise ValueError("Sandbox state unavailable; refusing") from failure
+    states: dict[str, str] = {}
+    for box in boxes:
+        profile = box.get("metadata", {}).get("hermes.profile_id", "")
+        if profile:
+            states[profile] = str(box.get("state", "?")).lower()
+    return states
 
 
 def password_record(password: str) -> dict:
@@ -83,7 +120,7 @@ def _write_profile_credential(profile: str, key: str, value: str | None) -> dict
         raise ValueError("Unsupported credential slot")
     if value is not None and (not value.strip() or any(character in value for character in "\r\n")):
         raise ValueError("Enter a nonempty single-line credential")
-    _, scope = _profile_config_scope(profile)
+    _, scope = _profile_config_scope(profile, write=True)
     with scope, _CONFIG_MUTATION_LOCK:
         if value is None:
             remove_provider_env_credential(key)
@@ -113,12 +150,14 @@ def _pocket_tts_settings(settings: dict, raw: dict) -> dict:
     return result
 
 
-def create_app(home: Path, *, secure_cookies: bool = False) -> FastAPI:
+def create_app(home: Path, *, secure_cookies: bool = False, cluster: "ClusterHomes | None" = None) -> FastAPI:
+    global _cluster
+    _cluster = cluster
     record = json.loads((home / "pocket-admin-auth.json").read_text())
     salt, expected = bytes.fromhex(record["salt"]), bytes.fromhex(record["digest"])
     if len(salt) != 16 or len(expected) != 64:
         raise ValueError("Invalid administrator password record")
-    authority = PocketAuthority(home / AUTHORITY_FILENAME)
+    authority = cluster.authority if cluster is not None else PocketAuthority(home / AUTHORITY_FILENAME)
     sessions: dict[str, float] = {}
     attempts: deque[float] = deque()
     application = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -183,6 +222,9 @@ def create_app(home: Path, *, secure_cookies: bool = False) -> FastAPI:
         from hermes_cli.profiles import list_profiles
 
         result = authority.management_snapshot()
+        if _cluster is not None:
+            result["profiles"] = [role["profile"] for role in result["roles"]]
+            return result
         result["profiles"] = [item.name for item in list_profiles(lazy_skill_count=True) if item.name != "default"]
         return result
 
@@ -194,6 +236,10 @@ def create_app(home: Path, *, secure_cookies: bool = False) -> FastAPI:
             profile = normalize_profile_name(body.profile)
             if profile in {"default", "current"}:
                 raise ValueError("Choose an independent named profile")
+            if _cluster is not None:
+                if not body.create_profile and profile not in _cluster.roles():
+                    raise ValueError("Profile does not exist; choose create profile")
+                return authority.issue_code(profile, ttl=body.ttl)
             profile_dir = get_profile_dir(profile)
             if body.create_profile:
                 if profile_dir.exists():
@@ -271,10 +317,12 @@ def create_app(home: Path, *, secure_cookies: bool = False) -> FastAPI:
     @application.delete("/api/pocket/roles/{role_id}/authorization")
     def disable(role_id: str):
         profile = authority.role_profile(role_id)
+        if _cluster is not None and profile and _cluster.home(profile).is_dir():
+            if _cluster.sandbox_states().get(profile, "absent") != "paused":
+                raise HTTPException(409, "Sandbox must be idle-paused before disabling: its schedules are held inside it")
         authority.disable_role(role_id)
-        if profile:
-            _hold_profile_schedules(profile)
-        return {"ok": True}
+        held = bool(profile) and _hold_profile_schedules(profile)
+        return {"ok": True, "schedules_held": held}
 
     @application.get("/{asset_path:path}")
     def assets(asset_path: str):
@@ -289,32 +337,68 @@ def create_app(home: Path, *, secure_cookies: bool = False) -> FastAPI:
     return application
 
 
-def _hold_profile_schedules(profile: str) -> None:
+def _hold_profile_schedules(profile: str) -> bool:
     """Pause this profile's schedules when authorization is turned off.
 
     A later authorization does not resume them; the user continues each one.
+    Returns False when there is nothing to hold (no profile home yet).
     """
     try:
-        _normalized, scope = _profile_config_scope(profile)
+        _normalized, scope = _profile_config_scope(profile, write=True)
     except ValueError:
-        return
+        return False
     with scope:
         from hermes_cli.pocket_schedule import hold_for_authorization
 
         hold_for_authorization()
+    return True
 
 
-def _profile_config_scope(profile: str):
+def _profile_config_scope(profile: str, *, write: bool = False):
     from hermes_cli.profiles import get_profile_dir, normalize_profile_name
     from hermes_cli.web_server_profiles import _config_profile_scope
 
     normalized = normalize_profile_name(profile)
     if normalized in {"default", "current"}:
         raise ValueError("Choose an independent named profile")
+    if _cluster is not None:
+        return normalized, _cluster_scope(normalized, write=write)
     profile_dir = get_profile_dir(normalized)
     if not profile_dir.is_dir():
         raise ValueError("Profile does not exist")
     return normalized, _config_profile_scope(normalized)
+
+
+def _cluster_scope(profile: str, *, write: bool):
+    """Scope onto the profile's node home. Writes need the sandbox idle-paused: a
+    paused sandbox resumes and re-reads the home, while a running or absent one
+    would clobber the edit or be restored over it (SnapshotService semantics)."""
+    if profile not in _cluster.roles():
+        raise ValueError("Profile does not exist")
+    home = _cluster.home(profile)
+    if not home.is_dir():
+        raise ValueError("Profile home does not exist yet: the profile has never run")
+    if write and _cluster.sandbox_states().get(profile, "absent") != "paused":
+        raise ValueError("Sandbox is not paused: edits wait for the idle pause")
+    return _scoped_home(home)
+
+
+@contextmanager
+def _scoped_home(home: Path):
+    from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
+    from hermes_cli.env_loader import hydrate_profile_secret_sources
+    from hermes_cli.web_server_profiles import _hermes_home_scope
+    from tui_gateway.launch_profile_policy import activate_multi_profile_hosting
+
+    activate_multi_profile_hosting()
+    hydrate_profile_secret_sources(home)
+    secrets = build_profile_secret_scope(home)
+    with _hermes_home_scope(home):
+        token = set_secret_scope(secrets, profile_home=str(home))
+        try:
+            yield
+        finally:
+            reset_secret_scope(token)
 
 
 def _read_profile_model_config(profile: str) -> dict:
@@ -346,7 +430,7 @@ def _write_profile_model_config(profile: str, body: ProfileConfigBody) -> dict:
     from hermes_cli.web_server_config import _normalize_main_model_assignment, _validated_main_model_selection, _apply_main_model_assignment
     from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK
 
-    normalized, scope = _profile_config_scope(profile)
+    normalized, scope = _profile_config_scope(profile, write=True)
     with scope:
         config = load_config()
         current = config.get("model", {})
@@ -356,7 +440,7 @@ def _write_profile_model_config(profile: str, body: ProfileConfigBody) -> dict:
         if (body.provider, body.model) != (current_provider, current_name):
             provider, model = _normalize_main_model_assignment(body.provider, body.model)
             result = _validated_main_model_selection(config, provider, model)
-    _, scope = _profile_config_scope(normalized)
+    _, scope = _profile_config_scope(normalized, write=True)
     with scope, _CONFIG_MUTATION_LOCK:
         config = load_config()
         current = config.get("model", {})
@@ -418,6 +502,8 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9122)
     parser.add_argument("--secure-cookies", action="store_true")
+    parser.add_argument("--cluster-root", default="", help="node profile homes, e.g. /data/shared/hermes-homes")
+    parser.add_argument("--cluster-cube-api", default="http://127.0.0.1:3000")
     options = parser.parse_args()
     home = Path(get_process_hermes_home())
     if options.setup:
@@ -436,7 +522,15 @@ def main():
         parser.error("Remote deployment requires HTTPS and --secure-cookies")
     import uvicorn
 
-    uvicorn.run(create_app(home, secure_cookies=options.secure_cookies), host=options.host, port=options.port)
+    cluster = None
+    if options.cluster_root:
+        cluster = ClusterHomes(
+            PocketAuthority(home / AUTHORITY_FILENAME),
+            Path(options.cluster_root),
+            lambda: cube_sandbox_states(options.cluster_cube_api),
+        )
+    uvicorn.run(create_app(home, secure_cookies=options.secure_cookies, cluster=cluster),
+                host=options.host, port=options.port)
 
 
 if __name__ == "__main__":
